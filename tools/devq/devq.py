@@ -6,7 +6,8 @@ pli-cp salloc, released as soon as the work ends; never one Slurm job per test).
                                                                with spaces: put anything with quotes in a script)
   devq.py wait ID [ID...]                                      block until done; print rc and log path
   devq.py ls                                                   pending / running / done
-  devq.py runner --gpus G [--idle-exit 1200]                   run inside the allocation (srun --overlap)
+  devq.py runner --gpus G [--idle-exit 1200] [--deadline S]    run inside the allocation (srun --overlap, or a
+                                                               wq job with DEVQ_NO_SCANCEL=1)
 
 Queue directory: $DEVQ_DIR (default $NANOMARIN_ROOT/tmp/devq). The runner gives each task its own GPUs via
 CUDA_VISIBLE_DEVICES, a per-task TMPDIR on scratch, `module load proxy/default` and HF offline env.
@@ -44,7 +45,7 @@ def _next_id():
 def submit(a):
     _mk()
     tid = _next_id()
-    task = {"id": tid, "name": a.name, "gpus": a.gpus, "cwd": os.path.abspath(a.cwd), "cmd": a.cmd,
+    task = {"id": tid, "name": a.name, "gpus": a.gpus, "arch": a.arch, "cwd": os.path.abspath(a.cwd), "cmd": a.cmd,
             "submitted": time.time()}
     tmp = os.path.join(SUB["pending"], f".{tid}.json")
     with open(tmp, "w") as f:
@@ -82,16 +83,20 @@ def ls(a):
         for fn in sorted(os.listdir(SUB[k])):
             if fn.endswith(".json") and not fn.startswith("."):
                 t = json.load(open(os.path.join(SUB[k], fn)))
-                print(k, t["id"], t["name"], f"gpus={t['gpus']}", f"rc={t.get('rc', '')}", t.get("devices", ""))
+                print(k, t["id"], t["name"], f"gpus={t['gpus']}", t.get("arch", "h100"), f"rc={t.get('rc', '')}", t.get("devices", ""))
 
 
 def runner(a):
     _mk()
     job = os.environ.get("SLURM_JOB_ID", "nojob")
-    free = list(range(a.gpus))
+    vis = [d for d in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if d.strip()]
+    free = vis[:a.gpus] if vis else [str(i) for i in range(a.gpus)]  # the GPUs this allocation owns
+    if len(free) < a.gpus:
+        sys.exit(f"runner: asked for {a.gpus} GPUs, CUDA_VISIBLE_DEVICES has {len(free)}")
     procs = {}  # tid -> (Popen, task, devices)
-    idle_since = time.time()
+    idle_since = t0 = time.time()
     while True:
+        draining = a.deadline and time.time() - t0 > a.deadline
         # reap
         for tid, (p, t, devs) in list(procs.items()):
             rc = p.poll()
@@ -102,29 +107,39 @@ def runner(a):
                 json.dump(t, f)
             os.remove(os.path.join(SUB["running"], f"{tid}.json"))
             free.extend(devs)
-            free.sort()
             del procs[tid]
             print(f"[devq] done {tid} {t['name']} rc={rc}", flush=True)
         # start FIFO tasks that fit (a task that does not fit blocks smaller later ones only if it is first)
         pend = sorted((f for f in os.listdir(SUB["pending"]) if f.endswith(".json") and not f.startswith(".")),
                       key=lambda f: int(f[1:-5]))
+        mine = 0  # pending tasks this runner could ever run (others must not keep it alive)
+        blocked = False
         for fn in pend:
-            t = json.load(open(os.path.join(SUB["pending"], fn)))
-            if t["gpus"] > a.gpus:
-                t.update(rc=-2, start=time.time(), end=time.time(), log="", error="needs more GPUs than allocated")
-                json.dump(t, open(os.path.join(SUB["done"], fn), "w"))
-                os.remove(os.path.join(SUB["pending"], fn))
+            try:
+                t = json.load(open(os.path.join(SUB["pending"], fn)))
+            except FileNotFoundError:
                 continue
-            if t["gpus"] > len(free):
-                break
+            if t.get("arch", "h100") not in ("any", a.arch):
+                continue  # e.g. an H100-only measurement on an A100 runner
+            if t["gpus"] > a.gpus:
+                continue  # leave it for a runner with more GPUs
+            mine += 1
+            if draining or blocked or t["gpus"] > len(free):
+                blocked = True  # FIFO: the first task that does not fit waits for GPUs
+                continue
+            try:
+                os.rename(os.path.join(SUB["pending"], fn), os.path.join(SUB["running"], fn))
+            except FileNotFoundError:
+                continue  # another runner claimed it
             devs, free = free[:t["gpus"]], free[t["gpus"]:]
             tid = t["id"]
             log = os.path.join(SUB["done"], f"{tid}.log")
             tmpdir = os.path.join(ROOT, "tmp", "job", f"{job}-{tid}")
             os.makedirs(tmpdir, exist_ok=True)
+            proxy = "" if os.environ.get("DEVQ_NO_PROXY") == "1" else "module load proxy/default >/dev/null 2>&1 || true\n"
             script = (
-                "module load proxy/default >/dev/null 2>&1 || true\n"
-                f"export TMPDIR={tmpdir} CUDA_VISIBLE_DEVICES={','.join(map(str, devs))}\n"
+                proxy +
+                f"export TMPDIR={tmpdir} CUDA_VISIBLE_DEVICES={','.join(devs)}\n"
                 f"export HF_HOME={ROOT}/cache/huggingface HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 "
                 "TRANSFORMERS_OFFLINE=1 WANDB_MODE=disabled\n"
                 f"cd {t['cwd']}\n"
@@ -132,15 +147,18 @@ def runner(a):
                 f"rc=$?; rm -rf {tmpdir}; exit $rc\n")
             t.update(start=time.time(), log=log, devices=devs, job=job)
             json.dump(t, open(os.path.join(SUB["running"], fn), "w"))
-            os.remove(os.path.join(SUB["pending"], fn))
             p = subprocess.Popen(["bash", "-lc", script], stdout=open(log, "w"), stderr=subprocess.STDOUT)
             procs[tid] = (p, t, devs)
             print(f"[devq] start {tid} {t['name']} gpus={devs}", flush=True)
-        if procs or pend:
+        if draining and not procs:
+            print(f"[devq] deadline {a.deadline}s reached, all tasks ended: exiting", flush=True)
+            return
+        if procs or (mine and not draining):
             idle_since = time.time()
         elif time.time() - idle_since > a.idle_exit:
             print(f"[devq] idle {a.idle_exit}s: releasing allocation {job}", flush=True)
-            subprocess.run(["scancel", job])
+            if os.environ.get("DEVQ_NO_SCANCEL") != "1":
+                subprocess.run(["scancel", job])
             return
         time.sleep(5)
 
@@ -152,6 +170,8 @@ def main():
     s.add_argument("--gpus", type=int, required=True)
     s.add_argument("--name", required=True)
     s.add_argument("--cwd", default=os.getcwd())
+    s.add_argument("--arch", default="h100", choices=["h100", "a100", "any"],
+                   help="where the task may run (default h100: timings and H100-numerics fixtures)")
     s.add_argument("cmd", nargs=argparse.REMAINDER)
     w = sp.add_parser("wait")
     w.add_argument("ids", nargs="+")
@@ -159,6 +179,8 @@ def main():
     r = sp.add_parser("runner")
     r.add_argument("--gpus", type=int, required=True)
     r.add_argument("--idle-exit", type=int, default=1200)
+    r.add_argument("--deadline", type=int, default=0, help="stop claiming tasks after this many seconds")
+    r.add_argument("--arch", default="h100", choices=["h100", "a100"])
     a = ap.parse_args()
     if a.c == "submit":
         if a.cmd and a.cmd[0] == "--":
