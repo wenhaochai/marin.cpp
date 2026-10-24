@@ -146,8 +146,9 @@ GPFS sustains it with 4 writers; E11 measures it. Step 4 makes the path safe for
 
 - Binding is by declared name with dtype and shape checks (`BindCtx::get("act.L3.gu", bf16, {T, 2F})`); a positional
   index never selects a buffer. A mismatch is fatal at bind time.
-- Debug modes (`exec.debug_arena`, local knob): `canary` puts 4 KiB guard bands between buffers and checks them after
-  every step; `poison` also fills transients, workspaces and recompute slots with NaN before each use. Both are run by
+- Debug modes (`exec.debug_arena`, local knob): `canary` puts a 4 KiB guard band before and after every buffer and
+  checks them after every step; `poison` also fills transients and workspaces (the recompute slots are transients)
+  with NaN before each use, never saved activations. Both are run by
   the S7 gates and by every new variant's tests; `compute-sanitizer` memcheck, racecheck and synccheck run on a 2-layer
   model per variant (eager mode).
 
@@ -271,11 +272,16 @@ the planner then also reduce-scatters vocab-sized gradients after every microbat
 | 300m | 32 (131,072) | 1 | all | 32,768 | 2.56 | 51.24 | 3.29 | 8.62 | 65.71 GiB |
 | 520m | 8 (32,768) | 8 | all | 16,384 | 4.94 | 31.75 | 1.05 | 4.45 | 42.19 GiB |
 | 1.2B | 8 (32,768) | 8 | all | 16,384 | 11.78 | 42.34 | 2.09 | 4.70 | 60.91 GiB |
-| 520m strict | 32 (131,072) | 2 | layer | 16,384 | 4.94 | 6.50 | 9.41 | 5.21 | 26.06 GiB |
-| 1.2B strict | 32 (131,072) | 2 | layer | 16,384 | 11.78 | 9.00 | 18.80 | 6.21 | 45.80 GiB |
+| 520m strict | 32 (131,072) | 2 | layer | 8,192 | 4.94 | 6.99 | 9.41 | 3.19 | 24.53 GiB |
+| 1.2B strict | 32 (131,072) | 2 | layer | 8,192 | 11.78 | 9.98 | 18.80 | 4.19 | 44.76 GiB |
 
-Every size fits. The strict plans copy levanter's 2 x 32 microbatching (§3.0); their per-microbatch head-gradient
-accumulator (V x D f32: 0.53 GB at 520m, 1.05 GB at 1.2B, Microbatch region) comes on top of the totals above.
+Every size fits. The strict rows are the plans `--size S --preset levanter_strict` runs: levanter's 2 x 32
+microbatching (§3.0), the CE chunk fixed at 8,192 rows (§3.8), and the per-microbatch head-gradient accumulator (V x D
+f32: 0.53 GB at 520m, 1.05 GB at 1.2B, Microbatch region, included in A).
+
+Fit rule: a plan fits when its arena (`device_bytes`: payload, 256-byte alignment, and the 4 KiB guard bands before and
+after every buffer when `exec.debug_arena` is on) is at most the budget; `choose_plan`, `marincpp plan` and the
+trainer use this one measure. The tables above list payloads (alignment adds under 1 MB).
 
 ## 3. Kernel plan
 
@@ -500,7 +506,9 @@ Kernel requirements, all stages (perf review 3):
 Chunk size rule: each chunk does a read-modify-write of the f32 head gradient (2·V·D·4 B, 525 MB at D = 512). The
 planner takes the smallest chunk (8,192 x 2^i rows, at most the microbatch) whose read-modify-write costs at most 0.5%
 of the step, capped by what fits with 2 GiB headroom: 130m 32,768; 300m 32,768; 520m and 1.2B 16,384; pls option B
-16,384 (cap). The strict preset fixes 8,192.
+16,384 (cap). The strict preset fixes 8,192. A microbatch below 8,192 tokens runs as one chunk of its tokens rounded up
+to a multiple of 128 (any `model.seq_len` resolves to a valid chunk). An explicit `exec.ce_chunk_rows` is the chunk
+the planner's fit test uses while it chooses `micro_seqs`.
 
 Logits store dtype (parity review 3): T1.0 item 2 reads whether XLA keeps the bf16 output of levanter's backward logit
 dot. `exec.ce_logits=auto` resolves to that fact (bf16 if kept, f32 if XLA folded the convert into an f32 GEMM output);
@@ -819,8 +827,10 @@ uninterrupted run bitwise (test in S10). A resume whose config hash differs exit
 
 `include/marincpp/knobs.def` declares every knob once. `Config` (config.hpp) is generated from it, as are the TOML
 parser, `--set section.name=value`, the canonical JSON, the run-id hash, the label and `marincpp knobs`. Knobs that
-name an extension (`model.block`, `model.input`, `model.head`, `model.losses`, `readout.kind`) are checked against the
-registries (`registry_has(kind, name)`), so a block name lives in one place: its `register_block` line. A value without
+name an extension (`model.block`, `model.input`, `model.head`, `model.losses`) are checked against the
+registries (`registry_has(kind, name)`), so a block name lives in one place: its `register_block` line.
+`readout.kind` (none, shared, separate) is a closed set of trunk wirings with no factory, so it is a fixed list;
+readouts that extend the model come through the readout table and the head registry (S13). A value without
 a registered implementation (e.g. `moda` today) is rejected. Cross-knob rules live in `validate()`. No knob is read
 from the environment (reliability R3).
 
@@ -829,8 +839,12 @@ from the environment (reliability R3).
 `run_id` = first 12 hex digits of sha256(canonical JSON of the hashed knobs whose value differs from the default, plus
 `kKnobTableVersion`). Adding a knob whose default keeps the old behaviour leaves every existing run id unchanged;
 changing any default bumps `kKnobTableVersion` (and so every id). File inputs that change numbers (init fixture,
-schedule fixture, data plan, dataset and eval metadata) enter by content hash. A fork checks the parent's hash against
-the config stored in the parent's manifest, so a parent made by an older binary still verifies.
+schedule fixture, data plan, dataset and eval metadata) enter by content hash only: `resolve()` stores
+`<path>#sha256=<hex>`, and the identity takes the hash, so the same content under another path or name gives the same
+run id. A fork checks the parent's hash against the config stored in the parent's manifest, so a parent made by an
+older binary still verifies. The identity is that of the RESOLVED config, and resolution depends on the binary
+(planner formulas, the §12.1 estimates behind the CE chunk, "auto" decisions still open): resume and fork load the
+stored resolved config and never re-resolve the original file.
 
 ### 9.3 How a research variant plugs in
 
@@ -983,7 +997,7 @@ backward side traffic 12·H·hd (accumulator clear, f32 dq accumulation, postpro
 | speedup (B1 / B2) | 3.4 / 3.9 | 3.8 / 4.1 | 4.1 / 4.3 | 2.7 / 2.7 | 2.3 / 2.8 |
 | levanter-formula MFU (B1) | 48% | 58% | 66% | 75% | 43% |
 | eval per run (s) | 32 | 155 | 295 | 1,274 | 1,045 |
-| levanter_strict step (B1) | — | — | 1944.0 | 3750.3 | — |
+| levanter_strict step (B1) | — | — | 1950.3 | 3762.8 | — |
 
 Notes:
 - Levanter's MFU formula counts full non-causal attention, so these MFU numbers overstate hardware use; they are

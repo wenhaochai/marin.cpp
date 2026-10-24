@@ -1,0 +1,6 @@
+/* Version script of libmarincpp_kernels.so: export only the C ABI of include/marincpp/capi.h (nm_*). Every C++ symbol
+   (nm::...) stays local, so the library cannot interpose with other libraries in the test process (torch). */
+{
+  global: nm_*;
+  local: *;
+};

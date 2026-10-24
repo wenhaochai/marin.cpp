@@ -8,9 +8,13 @@
 //   flags          -> NM_HASH: part of the run identity; NM_LOCAL: execution-local, excluded from the hash (paths,
 //                     logging, W&B names, debug modes). A knob that changes any number the run computes is NM_HASH,
 //                     including execution choices that only change summation order.
-//   tag            -> printf-style fragment appended to the human label when the value differs from the default
+//                     NM_CONTENT (with NM_HASH): a file input; resolve() appends "#sha256=<content hash>" and the identity
+//                     takes only that hash, so the path spelling stays local (./x and an absolute path give one id).
+//   tag            -> label fragment appended when the value differs from the default: at most one conversion, %d for
+//                     int knobs, %g for double, %s for string, none for bool (checked at compile time, knobs.cpp)
 //   check          -> a boolean expression over `v` (the value); cross-knob rules live in validate() (config.cpp).
 //                     Knobs naming an extension check registry_has(...): names live only in register_* lines.
+//                     Shape and batch ranges keep every integer product of the planner and the step budget exact.
 //   doc            -> one line; `marincpp knobs` prints this table.
 //
 // Identity: only hashed knobs that differ from their default enter the hash, plus kKnobTableVersion (config.hpp).
@@ -19,12 +23,12 @@
 // ---------------------------------------------------------------------------------------------------- model
 NM_KNOB(model, size,        std::string, "130m",     NM_LOCAL, "",          one_of(v, {"130m","300m","520m","1_2b","pls_d48","custom"}), "preset that fills the shape knobs below (label only; the resolved shape is hashed)")
 NM_KNOB(model, vocab,       int,         128256,     NM_HASH,  "-v%d",      v >= 256 && v <= (1 << 24), "vocabulary size V (untied embedding and head); sort key bits = ceil(log2 V)")
-NM_KNOB(model, hidden,      int,         512,        NM_HASH,  "-h%d",      v % 64 == 0, "hidden width D")
+NM_KNOB(model, hidden,      int,         512,        NM_HASH,  "-h%d",      v >= 64 && v <= 65536 && v % 64 == 0, "hidden width D")
 NM_KNOB(model, layers,      int,         6,          NM_HASH,  "-d%d",      v >= 1 && v <= 256, "number of transformer layers L")
-NM_KNOB(model, heads,       int,         8,          NM_HASH,  "",          v >= 1, "query heads H")
-NM_KNOB(model, kv_heads,    int,         8,          NM_HASH,  "",          v >= 1, "key/value heads KV (GQA if KV < H; query head h reads kv head h / (H/KV))")
+NM_KNOB(model, heads,       int,         8,          NM_HASH,  "",          v >= 1 && v <= 1024, "query heads H")
+NM_KNOB(model, kv_heads,    int,         8,          NM_HASH,  "",          v >= 1 && v <= 1024, "key/value heads KV (GQA if KV < H; query head h reads kv head h / (H/KV))")
 NM_KNOB(model, head_dim,    int,         0,          NM_HASH,  "",          v == 0 || v == 64 || v == 128, "head dim; 0 = hidden / heads")
-NM_KNOB(model, mlp,         int,         1792,       NM_HASH,  "",          v % 64 == 0, "SwiGLU width F")
+NM_KNOB(model, mlp,         int,         1792,       NM_HASH,  "",          v >= 64 && v <= (1 << 20) && v % 64 == 0, "SwiGLU width F")
 NM_KNOB(model, seq_len,     int,         4096,       NM_HASH,  "-sl%d",     v >= 128 && v <= 65536, "training window S (any value; attention has no block constraint)")
 NM_KNOB(model, rope_theta,  double,      10000.0,    NM_HASH,  "",          v > 0, "RoPE base; inv_freq built in f32 as numerics.md 3.3")
 NM_KNOB(model, norm_eps,    double,      1e-5,       NM_HASH,  "",          v > 0, "RMSNorm eps, inside the rsqrt")
@@ -40,7 +44,7 @@ NM_KNOB(model, trunk,       std::string, "train",    NM_HASH,  "-trunk%s",  one_
 // ---------------------------------------------------------------------------------------------------- init
 NM_KNOB(init, seed,         int,         0,          NM_HASH,  "-s%d",      v >= 0, "trainer seed; threefry2x32 key tree of model.md 4.2")
 NM_KNOB(init, mode,         std::string, "threefry", NM_HASH,  "",          one_of(v, {"threefry","fixture","from"}), "threefry: port of JAX init (XLA f32 erf/erf_inv); fixture: levref init (parity runs use it until T1.1 passes bitwise); from: another run's tensors")
-NM_KNOB(init, fixture,      std::string, "",         NM_HASH,  "",          true, "path of an init fixture; resolved to its sha256 in the hashed config")
+NM_KNOB(init, fixture,      std::string, "",         NM_HASH | NM_CONTENT, "",          true, "path of an init fixture; resolved to its sha256 in the hashed config")
 NM_KNOB(init, from,         std::string, "",         NM_HASH,  "-from",     true, "<run_id>@<step> or a manifest path (init.mode=from); its hash is checked against its own manifest")
 NM_KNOB(init, map,          std::string, "",         NM_HASH,  "",          true, "ordered rules 'target_regex=source|init;...' mapping tensors from init.from")
 NM_KNOB(init, freeze,       std::string, "",         NM_HASH,  "-frz",      true, "regex of tensors placed in group Frozen")
@@ -48,7 +52,7 @@ NM_KNOB(init, opt_state,    std::string, "fresh",    NM_HASH,  "",          one_
 
 // ---------------------------------------------------------------------------------------------------- per-layer readouts (pls)
 NM_KNOB(readout, kind,      std::string, "none",     NM_HASH,  "-pls%s",    one_of(v, {"none","shared","separate"}), "per-layer LM readouts: none, through the final norm+head (shared), or own norm+head per layer (separate)")
-NM_KNOB(readout, table,     std::string, "",         NM_HASH,  "-rt",       true, "optional readout-table file (several readouts per layer, modes train/probe/monitor, groups); hashed by content")
+NM_KNOB(readout, table,     std::string, "",         NM_HASH | NM_CONTENT, "-rt",       true, "optional readout-table file (several readouts per layer, modes train/probe/monitor, groups); hashed by content")
 NM_KNOB(readout, weight,    double,      1.0,        NM_HASH,  "-w%g",      v >= 0, "weight of every intermediate readout loss (final layer weight is 1)")
 NM_KNOB(readout, shape,     std::string, "uniform",  NM_HASH,  "-sh%s",     one_of(v, {"uniform","depth"}), "intermediate weights: uniform, or weight*2(k+1)/L")
 NM_KNOB(readout, detach_head, bool,      false,      NM_HASH,  "-dh",       true, "shared heads: intermediate losses train the trunk only")
@@ -72,33 +76,33 @@ NM_KNOB(optim, ns_steps,    int,         5,          NM_HASH,  "",          v >=
 NM_KNOB(optim, ns_coeffs,   std::string, "simple",   NM_HASH,  "",          one_of(v, {"simple","quintic","polar_express"}), "NS coefficient set; simple = (3.4445, -4.7750, 2.0315) every step")
 NM_KNOB(optim, ns_precision, std::string, "auto",    NM_HASH,  "-ns%s",     one_of(v, {"auto","f32","3xtf32","tf32"}), "NS matmul precision; auto = T1.0 fact (TF32, or 3xTF32 if T1.6 holds, else f32)")
 NM_KNOB(optim, max_grad_norm, double,    1.0,        NM_HASH,  "",          v > 0, "clip threshold, applied to each clip group's own norm")
-NM_KNOB(optim, groups,      std::string, "",         NM_HASH,  "-grp",      true, "optional GroupSpec file (extra groups, eps/betas/lr tables, grad/update scales, post-update hooks); hashed by content")
-NM_KNOB(optim, row_partition, std::string, "",       NM_HASH,  "-rp",       true, "optional RowPartition file (per-row freeze / lr / norm blocks for Adam and AdamH); hashed by content")
+NM_KNOB(optim, groups,      std::string, "",         NM_HASH | NM_CONTENT, "-grp",      true, "optional GroupSpec file (extra groups, eps/betas/lr tables, grad/update scales, post-update hooks); hashed by content")
+NM_KNOB(optim, row_partition, std::string, "",       NM_HASH | NM_CONTENT, "-rp",       true, "optional RowPartition file (per-row freeze / lr / norm blocks for Adam and AdamH); hashed by content")
 NM_KNOB(optim, schedule,    std::string, "linear",   NM_HASH,  "",          one_of(v, {"linear","cosine"}), "130m: constant then linear to 0; others: warmup then cosine to 0")
 NM_KNOB(optim, warmup,      int,         0,          NM_HASH,  "",          v >= 0, "warmup steps")
 NM_KNOB(optim, decay,       double,      0.8,        NM_HASH,  "",          v >= -1, "decay length: <=1 fraction of N (int(x*N)), >1 steps, -1 = N - warmup")
 NM_KNOB(optim, min_lr_ratio, double,     0.0,        NM_HASH,  "",          v >= 0 && v <= 1, "end value / peak")
 NM_KNOB(optim, num_steps,   int,         4959,       NM_HASH,  "-n%d",      v >= 1, "updates N")
-NM_KNOB(optim, schedule_fixture, std::string, "",    NM_HASH,  "",          true, "dir with f32 sched_main, sched_adam [N] and 1-b1^t, 1-b2^t from jitted optax (tools/levref/schedules.py); required for parity runs")
+NM_KNOB(optim, schedule_fixture, std::string, "",    NM_HASH | NM_CONTENT, "",          true, "dir with f32 sched_main, sched_adam [N] and 1-b1^t, 1-b2^t from jitted optax (tools/levref/schedules.py); required for parity runs")
 NM_KNOB(optim, weight_decay, double,     0.0,        NM_HASH,  "-wd%g",     v >= 0, "decoupled weight decay actually applied; > 0 with a muonh_qwen3 preset requires optim.wd_variant")
 NM_KNOB(optim, wd_variant,  bool,        false,      NM_HASH,  "-wdv",      true, "acknowledges a weight-decay variant (levanter logs 0.1 but the baseline applies none)")
 NM_KNOB(optim, zero1,       std::string, "auto",     NM_HASH,  "",          one_of(v, {"auto","on","off"}), "ZeRO-1 ownership for every optimizer group (DESIGN.md §6.1); off = replicated optimizer")
-NM_KNOB(optim, zero2_vocab, std::string, "auto",     NM_HASH,  "",          one_of(v, {"auto","on","off"}), "reduce-scatter vocab-sized gradients after every microbatch when it buys memory")
+NM_KNOB(optim, zero2_vocab, std::string, "auto",     NM_HASH,  "",          one_of(v, {"auto","on","off"}), "ZeRO-2 for vocab-sized gradients (reduce-scatter after every microbatch); not implemented yet: auto resolves to off, on is refused")
 
 // ---------------------------------------------------------------------------------------------------- data (data.md)
-NM_KNOB(data, dataset,      std::string, "fineweb-edu-10B-marin128k", NM_HASH, "", true, "converted token set under $NM_DATA (its meta.json sha256 is hashed)")
+NM_KNOB(data, dataset,      std::string, "fineweb-edu-10B-marin128k", NM_HASH | NM_CONTENT, "", true, "converted token set under $NM_DATA (its meta.json sha256 is hashed)")
 NM_KNOB(data, data_seed,    int,         42,         NM_HASH,  "-ds%d",     v >= 0, "levanter data_seed: mixture block shuffle + LCG permutation")
-NM_KNOB(data, global_batch, int,         128,        NM_HASH,  "-b%d",      v >= 1, "sequences per update B (phases of data.plan may change it)")
+NM_KNOB(data, global_batch, int,         128,        NM_HASH,  "-b%d",      v >= 1 && v <= (1 << 20), "sequences per update B (phases of data.plan may change it)")
 NM_KNOB(data, mix_block,    int,         2048,       NM_HASH,  "",          v >= 1, "levanter mixture block size")
-NM_KNOB(data, plan,         std::string, "",         NM_HASH,  "-dp%s",     true, "optional phase file (repeats with real-valued passes, reshuffles, per-phase batch / seq_len, explicit ids); hashed by content")
+NM_KNOB(data, plan,         std::string, "",         NM_HASH | NM_CONTENT, "-dp%s",     true, "optional phase file (repeats with real-valued passes, reshuffles, per-phase batch / seq_len, explicit ids); hashed by content")
 NM_KNOB(data, prefetch_steps, int,       256,        NM_LOCAL, "",          v >= 4, "depth of the pageable prefetch ring in steps (separate from launch lookahead 2)")
 NM_KNOB(data, reader_threads, int,       16,         NM_LOCAL, "",          v >= 1 && v <= 64, "reader threads filling the prefetch ring")
 
 // ---------------------------------------------------------------------------------------------------- eval (eval.md)
-NM_KNOB(eval, paloma,       std::string, "paloma-marin128k", NM_HASH, "",  true, "converted Paloma val set under $NM_DATA")
-NM_KNOB(eval, extra_sources, std::string, "",        NM_HASH,  "",          true, "extra EvalSources (DataPlan slices, sequence-id lists) with groupings; hashed by content")
+NM_KNOB(eval, paloma,       std::string, "paloma-marin128k", NM_HASH | NM_CONTENT, "",  true, "converted Paloma val set under $NM_DATA (its meta.json sha256 is hashed)")
+NM_KNOB(eval, extra_sources, std::string, "",        NM_HASH | NM_CONTENT, "",          true, "extra EvalSources (DataPlan slices, sequence-id lists) with groupings; hashed by content")
 NM_KNOB(eval, every,        int,         1000,       NM_HASH,  "",          v >= 0, "eval after update s when s % every == 0, s > 0 (logged at s; levanter off-by-one); 0 = final only")
-NM_KNOB(eval, batch,        int,         128,        NM_HASH,  "",          v >= 1, "estimator batch in sequences, independent of the GPU count (the bpb estimator depends on it)")
+NM_KNOB(eval, batch,        int,         128,        NM_HASH,  "",          v >= 1 && v <= (1 << 20), "estimator batch in sequences, independent of the GPU count (the bpb estimator depends on it)")
 NM_KNOB(eval, micro_batches, int,        0,          NM_HASH,  "",          v >= 0, "estimator batches per eval microbatch; 0 = largest that fits")
 NM_KNOB(eval, init_eval,    bool,        true,       NM_HASH,  "",          true, "evaluate before update 0 (gate a3), logged under eval_init/")
 NM_KNOB(eval, exact_bpb,    bool,        true,       NM_HASH,  "",          true, "also log eval_exact/* (and eval_exact_shared/* across tokenizers)")

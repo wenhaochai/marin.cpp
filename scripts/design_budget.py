@@ -6,6 +6,10 @@ Version 2 (after the perf/parity/research review): ZeRO-1 by ownership for every
 rows in the attention workspaces, CE chunk = largest that fits, B1 / B1.5 / B2 CE traffic, stage-1 epilogue fusions,
 FA3 backward side traffic, embedding reduce-scatter exposure, eval time per run, and the levanter_strict plan
 (remat=layer, 2 x 32 sequences per GPU at 520m / 1_2b).
+
+Version 2.1 (S0 review): the strict plans are what `--preset levanter_strict` runs (CE chunk fixed at 8,192 rows plus
+the per-microbatch head-gradient accumulator mb.ce_dw_accum); ZeRO-1 owner shards are ceil(n / NGPU) elements, as the
+C++ planner sizes them; CE head-gradient read-modify-writes count ceil(micro tokens / chunk) chunks per microbatch.
 """
 
 GiB = 1024**3
@@ -69,21 +73,22 @@ def ce_rows_for(T, heads, budget_left):
 SEGS = 24      # training b_max per row; sizes only cu_seqlens / segment tables now (no padding rows)
 
 
-def detailed(name, mb, pol, zero1=True, ce_rows=8192, logits_f32=False):
+def detailed(name, mb, pol, zero1=True, ce_rows=8192, logits_f32=False, strict=False):
     c = SIZES[name]; D, L, H, KV, hd, F = c["D"], c["L"], c["H"], c["KV"], c["hd"], c["F"]
     p = params(c); T = mb * S; spg = c["B"] // NGPU
-    z = 1.0 / NGPU if zero1 else 1.0
+    def shard(n):  # elements of the largest ZeRO-1 owner shard (even split until S6 plan_ownership)
+        return -(-n // NGPU) if zero1 else n
     rows = []
     def add(n, life, count, each): rows.append((n, life, count, int(each), int(count * each)))
     tag = ", ZeRO-1 owner shard" if zero1 else ""
-    add("param.f32 muonh (q,k,v,o,gate,up,down)" + tag, "P", 1, 4 * p["muon"] * z)
-    add("param.f32 adam (embedding + norm gains)" + tag, "P", 1, 4 * (p["emb"] + p["norms"]) * z)
-    add("param.f32 adamh (lm_head%s)%s" % (" + 47 aux heads" if c["heads"] > 1 else "", tag), "P", 1, 4 * p["heads"] * z)
+    add("param.f32 muonh (q,k,v,o,gate,up,down)" + tag, "P", 1, 4 * shard(p["muon"]))
+    add("param.f32 adam (embedding + norm gains)" + tag, "P", 1, 4 * shard(p["emb"] + p["norms"]))
+    add("param.f32 adamh (lm_head%s)%s" % (" + 47 aux heads" if c["heads"] > 1 else "", tag), "P", 1, 4 * shard(p["heads"]))
     add("param.bf16 (all, replicated compute copy)", "P", 1, 2 * p["total"])
     add("grad.f32 (all; bucket order)", "P", 1, 4 * p["total"])
-    add("muonh.momentum.f32" + tag, "P", 1, 4 * p["muon"] * z)
-    add("adam.mu,nu.f32" + tag, "P", 1, 8 * (p["emb"] + p["norms"]) * z)
-    add("adamh.mu,nu.f32" + tag, "P", 1, 8 * p["heads"] * z)
+    add("muonh.momentum.f32" + tag, "P", 1, 4 * shard(p["muon"]))
+    add("adam.mu,nu.f32" + tag, "P", 1, 8 * shard(p["emb"] + p["norms"]))
+    add("adamh.mu,nu.f32" + tag, "P", 1, 8 * shard(p["heads"]))
     mats = [(D, H * hd), (KV * hd, D), (D, F)]
     mxn = max(a * b for a, b in mats); mm = max(min(a, b) ** 2 for a, b in mats)
     add("ns.workspace.f32 (X, X', A, B; 4-matrix batch)", "P", 1, 4 * (2 * mxn + 2 * mm) * 4)
@@ -93,6 +98,8 @@ def detailed(name, mb, pol, zero1=True, ce_rows=8192, logits_f32=False):
     add("metrics.ring + stat slots", "P", 1, 64 * 2**20)
     add("mb.targets.i32 / mb.pos.i32", "A", 2, T * 4)
     add("mb.seg_table.i32 [rows*%d+1]" % SEGS, "A", 1, (mb * SEGS + 1) * 4)
+    if strict:
+        add("mb.ce_dw_accum.f32 [V, D] (strict per-microbatch head-gradient accumulator)", "A", 1, 4 * V * D)
     per = act_per_token_layer(c, pol)
     for k, v in per.items():
         if v: add(f"act.L*.{k}", "A", L, v * T)
@@ -139,7 +146,7 @@ def perf(c, mb_seqs, pol, zero1=True, ce_stage="B1", fused=True, ns_prec="tf32",
     out["ce_gemm"] = ce_flops / (e * PEAK)
     extra = {"B1": 6, "B1.5": 4, "B2": 2}[ce_stage]
     out["ce_mem"] = extra * V * T * c["heads"] / HBM
-    chunks_per_head = T // ce_rows                                  # per step (all microbatches)
+    chunks_per_head = n_micro * -(-(mb_seqs * S) // ce_rows)        # per step: ceil(micro tokens / chunk) per microbatch
     out["ce_head_grad_rmw"] = c["heads"] * chunks_per_head * 2 * V * D * 4 / HBM
     ew = (40 * D + 16 * F + 10 * (H + KV) * hd)
     if fused:
@@ -180,15 +187,16 @@ def lev_fpt(c):
 
 CHOSEN = [("130m", 32, "all", True), ("300m", 32, "all", True), ("520m", 8, "all", True),
           ("1_2b", 8, "all", True), ("pls_d48", 4, "min", False), ("pls_d48", 8, "all", True)]
-STRICT = [("520m", 32, "layer", True), ("1_2b", 32, "layer", True)]
+STRICT = [("520m", 32, "layer", True), ("1_2b", 32, "layer", True)]   # --preset levanter_strict (§3.0)
+STRICT_CE_ROWS = 8192   # the preset fixes the CE chunk (§3.8)
 BUDGET = 72 * GiB
 
 
-def show(name, mb, pol, z, perf_rows=True):
+def chunk_rule(name, mb, pol, z):
+    """CE chunk rule (DESIGN.md §3.8): the smallest chunk (8192 * 2^i) whose head-gradient read-modify-write costs
+    <= 0.5% of the step, capped by what fits with 2 GiB headroom."""
     c = SIZES[name]
-    # CE chunk rule (DESIGN.md §3.8): the smallest chunk (8192 * 2^i) whose head-gradient read-modify-write costs
-    # <= 0.5% of the step, capped by what fits with 2 GiB headroom.
-    rows0, tot0 = detailed(name, mb, pol, z, 8192)
+    _, tot0 = detailed(name, mb, pol, z, 8192)
     cap = ce_rows_for(mb * S, c["heads"], BUDGET - tot0 - 2 * GiB)
     ce_rows = 8192
     while ce_rows < cap:
@@ -196,7 +204,13 @@ def show(name, mb, pol, z, perf_rows=True):
         if out["ce_head_grad_rmw"] <= 0.005 * step:
             break
         ce_rows *= 2
-    rows, tot = detailed(name, mb, pol, z, ce_rows)
+    return ce_rows
+
+
+def show(name, mb, pol, z, perf_rows=True, strict=False):
+    c = SIZES[name]
+    ce_rows = STRICT_CE_ROWS if strict else chunk_rule(name, mb, pol, z)
+    rows, tot = detailed(name, mb, pol, z, ce_rows, strict=strict)
     print(f"\n### {name} micro={mb} seqs/GPU ({mb*S} tokens) remat={pol} zero1={z} ce_rows={ce_rows}: "
           f"total {tot:,} B = {tot/GiB:.2f} GiB")
     print("| buffer | life | count | bytes each | bytes total |")
@@ -206,7 +220,7 @@ def show(name, mb, pol, z, perf_rows=True):
     for r in rows:
         sub[r[1]] = sub.get(r[1], 0) + r[4]
     print("subtotals GiB:", {k: round(v / GiB, 2) for k, v in sub.items()})
-    _, totf = detailed(name, mb, pol, z, 8192, logits_f32=True)
+    _, totf = detailed(name, mb, pol, z, 8192, logits_f32=True, strict=strict)
     print(f"with f32 CE logits store at 8192 rows: {totf/GiB:.2f} GiB")
     if not perf_rows:
         return
@@ -227,9 +241,9 @@ def show(name, mb, pol, z, perf_rows=True):
 def main():
     for name, mb, pol, z in CHOSEN:
         show(name, mb, pol, z)
-    print("\n## levanter_strict plans (2 x 32 sequences per GPU, remat=layer)")
+    print("\n## levanter_strict plans (2 x 32 sequences per GPU, remat=layer, CE chunk 8192, head-gradient accumulator)")
     for name, mb, pol, z in STRICT:
-        show(name, mb, pol, z)
+        show(name, mb, pol, z, strict=True)
 
 
 if __name__ == "__main__":

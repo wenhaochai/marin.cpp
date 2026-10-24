@@ -2,20 +2,28 @@
  * No Python is linked into the training binary; this library is the same object code the binary links. The portable
  * kernels are also built for sm_80/86 (vis-node tests); FA3, CE B1/B1.5/B2 and custom WGMMA kernels need sm_90a.
  * All pointers are device pointers unless named *_host. `stream` is a cudaStream_t (0 = legacy default stream).
- * Every function returns 0 on success, else a nonzero code; nm_last_error() returns the message (thread-local).
+ * Every int function returns NM_OK (0) on success, else NM_ERR_INVALID (1: bad argument, config or requirement),
+ * NM_ERR_DEVICE (2: a CUDA, NCCL or cuBLAS call failed) or NM_ERR_INTERNAL (3: any other failure); nm_last_error()
+ * returns the message (thread-local). The library exports only the nm_* symbols (cmake/capi.map).
  * `rounding`: 0 = levanter, 1 = accurate. `dtype`: 0 = f32 storage (f32 compute policy), 1 = bf16 storage.     */
 #ifndef MARINCPP_CAPI_H
 #define MARINCPP_CAPI_H
 
 #include <stdint.h>
 
+#define NM_OK 0
+#define NM_ERR_INVALID 1
+#define NM_ERR_DEVICE 2
+#define NM_ERR_INTERNAL 3
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-const char* nm_version(void);        /* git sha of the build */
+const char* nm_version(void);        /* git sha of the build ("+dirty": uncommitted or untracked sources) */
 const char* nm_last_error(void);
-int nm_device_arch(void);            /* 80, 86, 90: tests skip sm_90a-only kernels elsewhere */
+int nm_device_arch(void);            /* 80, 86, 90: tests skip sm_90a-only kernels elsewhere; 0 on a CUDA error
+                                        (nm_last_error says which; the CUDA error state is cleared) */
 
 /* ---- elementwise (kernels/elementwise.hpp) ---------------------------------------------------------------- */
 int nm_doc_meta(const int32_t* tokens, const uint8_t* row_valid, int rows, int S, int32_t eos, int max_segs,
