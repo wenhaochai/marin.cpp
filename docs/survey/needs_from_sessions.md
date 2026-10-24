@@ -59,4 +59,4 @@ Questions sent by marincpp: (1) what you change most, which files each change to
 
 ## Owner stage-1 goal (2026-10-24)
 
-「你可以先从复现kaiyue baseline作为一个一阶段目标」: stage 1 of nanomarin = reproduce Kaiyue Wen's muonh_qwen3 baseline (della_muonh_qwen3_scaling.py, 130m first, then 300m/520m/1.2B) on the same data, steps and batch, matching the levanter runs within seed noise, at higher tokens/s.
+「你可以先从复现kaiyue baseline作为一个一阶段目标」: stage 1 of marincpp = reproduce Kaiyue Wen's muonh_qwen3 baseline (della_muonh_qwen3_scaling.py, 130m first, then 300m/520m/1.2B) on the same data, steps and batch, matching the levanter runs within seed noise, at higher tokens/s.

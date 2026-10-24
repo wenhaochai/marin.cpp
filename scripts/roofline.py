@@ -2,7 +2,7 @@
 
 Pure arithmetic, no JAX. Run on a vis node:
     ssh della-vis1 'nice -n 19 $ROOT/project/marin/.venv/bin/python \
-        $ROOT/project/nanomarin/scripts/roofline.py'
+        $ROOT/project/marin.cpp/scripts/roofline.py'
 Prints Markdown tables (pasted into docs/survey/roofline.md) and writes roofline.json next to this script.
 
 Sources of the configs (read 2026-10-24, read-only):

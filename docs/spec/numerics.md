@@ -22,7 +22,7 @@ HEAD, so every library line cited here is the code that ran.
 | `HX` | `lib/haliax/src/haliax` |
 | `CE` | `LV/kernels/pallas/fused_cross_entropy_loss` |
 | `FA` | `LV/models/flash_attention.py` |
-| `NC` | `$ROOT/project/nanomarin/cache` |
+| `NC` | `$ROOT/project/marin.cpp/cache` |
 | `J130` | `NC/hlo/130m/train_step.jaxpr.squeezed.txt`: the 130m baseline's traced train-step jaxpr, written by the run itself on 2026-09-14 04:18 (`logs/muonh-qwen3-130m-della4xh100/artifacts/train_step.jaxpr.txt.gz`, runs of spaces squeezed, line numbers unchanged) |
 | `H<size>` | `NC/hlo/<size>/train_step.hlo.txt`: the lowered StableHLO of each size's train step (pre-optimization, pre-SPMD), copied from `logs/muonh-qwen3-<size>-della4xh100/artifacts/` |
 
@@ -74,7 +74,7 @@ changes no gradient that matters, but a bit-level comparison sees it. A rewrite 
 
 ## 1. Classification and summary
 
-* **M (math):** the item changes the function that is computed. nanomarin must reproduce it exactly.
+* **M (math):** the item changes the function that is computed. marincpp must reproduce it exactly.
 * **P (precision):** the item is a rounding point or a dtype. The math is the same, and only the rounding changes. Use
   the reference choice in the parity run. A change that raises precision is allowed after an A/B test shows no effect:
   n >= 4 runs per arm, gates `targets.md` §4(c). A change that lowers precision is not allowed in stage 1.
@@ -212,7 +212,7 @@ dx  = bf16(t1 + t2)                              # km, kn: the only rounding of 
 * P: the angle reaches `4095 * inv_freq[0] = 4095` rad. Half a bf16 ulp near 1 is 2^-9 (about 2e-3). A cos/sin
   without full-range argument reduction (CUDA `__cosf`/`__sinf`, `--use_fast_math`) can err by a large fraction of
   that at 4095 rad and flip table entries after the bf16 cast. A 1-ulp difference in an `inv_freq` entry moves the
-  angle at pos 4095 by up to about 2.4e-4 rad and can also flip entries. So nanomarin either uses accurate f32
+  angle at pos 4095 by up to about 2.4e-4 rad and can also flip entries. So marincpp either uses accurate f32
   cos/sin on the f32 angle `f32(f32(pos) * inv_freq)`, with `inv_freq` built in f32 in the order above, or copies the
   exact f32 `inv_freq` and the bf16 cos/sin tables `[4096, hd]` from the reference (O4).
 * The rotation runs in bf16: `q*cos + concat(-q[hd/2:], q[:hd/2])*sin` (`J130:2639-2668`; `rotary.py:17-22, 45`).
@@ -577,7 +577,7 @@ The rerun `muonh-qwen3-130m-della4xh100-restore` (2026-09-29) used the same conf
   (`docs/della/objective-hillclimb.md:516, 729`). The throughput cost of determinism is therefore unmeasured.
 * Consequence: the reference alone shows about 1 sd of run-to-run spread. This floor is what makes every P item
   testable only by distribution.
-* For nanomarin, a deterministic embedding backward (sorted segment-sum, f32 accumulator) is S and recommended. It
+* For marincpp, a deterministic embedding backward (sorted segment-sum, f32 accumulator) is S and recommended. It
   makes A/B tests of single P items possible at n = 1 per seed for debugging. Gates still follow `targets.md`.
 
 ## 10. Open items (need a GPU node; nothing was submitted)
@@ -596,9 +596,9 @@ The rerun `muonh-qwen3-130m-della4xh100-restore` (2026-09-29) used the same conf
   `precision_config`/algorithm) for Newton-Schulz and the flash `dV`. In the same job, record the loaded libraries
   (`/proc/<pid>/maps` or `LD_DEBUG=libs`) to confirm which `libcublas`, `libcudnn` and `libnccl` builds ran (§0).
 * **O3. Scale of P items.** One A/B at 130m against the 8-run pool: f32 attention softmax and accumulators versus the
-  reference bf16 (§4.5). This is the first deviation nanomarin will want.
+  reference bf16 (§4.5). This is the first deviation marincpp will want.
 * **O4. RoPE tables.** On a GPU node, run the `DefaultRotaryEmbeddings` code path once at hd 64 and hd 128 and save the
-  f32 `inv_freq` and the bf16 cos/sin tables `[4096, hd]` (§3.3). nanomarin either loads them or tests its own tables
+  f32 `inv_freq` and the bf16 cos/sin tables `[4096, hd]` (§3.3). marincpp either loads them or tests its own tables
   against them bit for bit.
 
 ## 11. Findings that belong to other sections (verified while reading)

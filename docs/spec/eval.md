@@ -29,8 +29,8 @@ levanter muonh_qwen3 baseline, so `scripts/della/objective_compare.py` runs on i
   `experiments/references/della_muonh_qwen3_scaling.py`.
 - Authoritative values: the W&B runs `reself/marin-della/muonh-qwen3-{130m,300m,520m,1_2b}-della4xh100` (state
   `finished`). The config, the summary and the logging steps are cached in
-  `nanomarin/cache/wandb/api/<run>.meta.json`, written by `cache/wandb/_tools/api_meta.py` on della-vis1. The history
-  of each local run segment is cached in `nanomarin/cache/wandb/run-*.jsonl.gz`.
+  `marincpp/cache/wandb/api/<run>.meta.json`, written by `cache/wandb/_tools/api_meta.py` on della-vis1. The history
+  of each local run segment is cached in `marincpp/cache/wandb/run-*.jsonl.gz`.
 - Default knobs: no VARIANT, EMA_BETA=0, TPP=20, VOCAB_K=0, SEQ_LEN=4096, BATCH=0, SMOKE_STEPS=0, NUM_GPUS=4.
 
 ## 1. Eval schedule
@@ -527,7 +527,7 @@ The script reads W&B only. It reads `run.summary` (the last logged value of each
      (lines 163-171). The new stack must emit all 16 and no extra key that matches this pattern.
 4. The current 130m pool: `--pool=,-s1,-s2,-s3,-ema0.999,-ema0.999-s1,-ema0.999-s2,-ema0.999-s3`
    (docs/della/sampled-softmax.md:90). Example readout of four new-stack runs:
-   `.venv/bin/python scripts/della/objective_compare.py --pool=,-s1,-s2,-s3,-ema0.999,-ema0.999-s1,-ema0.999-s2,-ema0.999-s3 --cell=-nm,-nm-s1,-nm-s2,-nm-s3 --name=nanomarin`
+   `.venv/bin/python scripts/della/objective_compare.py --pool=,-s1,-s2,-s3,-ema0.999,-ema0.999-s1,-ema0.999-s2,-ema0.999-s3 --cell=-nm,-nm-s1,-nm-s2,-nm-s3 --name=marincpp`
    (on a vis node, `--flag=value` form).
 
 Optional exact bpb (a need of the Tokenizer Size session, docs/survey/needs_from_sessions.md): log it under a prefix

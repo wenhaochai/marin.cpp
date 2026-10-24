@@ -12,7 +12,7 @@ the two agree. Its outputs are in `cache/data/data_ref.json`. All other facts ci
 
 **Abbreviations.** `M/` = `$ROOT/project/marin` (read-only reference). `L/` =
 `M/lib/levanter/src/levanter`. `J/` = `M/.venv/lib/python3.12/site-packages/jax/_src`. `S/` =
-`$ROOT/marin_store_big`. `N/` = `$ROOT/project/nanomarin`.
+`$ROOT/marin_store_big`. `N/` = `$ROOT/project/marin.cpp`.
 Line numbers are for marin HEAD `1793624070`.
 
 **Code version.** Each run is a chain of resume segments, and each segment logs its own `git_commit`; the run-level

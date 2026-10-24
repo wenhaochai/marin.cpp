@@ -18,7 +18,7 @@ is `.venv/lib/python3.12/site-packages/jax` (jax 0.11.1).
 | 1_2b | `muonh-qwen3-1_2b-della4xh100` | `cead09a2590b` |
 
 - Cached configs: `cache/wandb/muonh-qwen3-<size>-della4xh100.config.json`, written by `cache/wandb/_tools/fetch_config.py`
-  (paths relative to `project/nanomarin`).
+  (paths relative to `project/marin.cpp`).
 - `git diff --stat <commit> HEAD -- lib/levanter/src/levanter lib/haliax/src/haliax` lists exactly one file for each
   of the four commits: `levanter/trainer.py` (+17 lines, 0 deleted). Every other levanter and haliax file is unchanged,
   including all files this spec cites (qwen.py, llama.py, attention.py, attention_mask.py, flash_attention.py,
@@ -471,7 +471,7 @@ MFU[%] = flops_per_example * batch / step_seconds / (n_gpu * 989.5e12) * 100   #
 - Peak: W&B `throughput/theoretical_flops` = 3.958e15 for 4x "NVIDIA H100 80GB HBM3".
 - Check: the 130m step at `_step` 2 took 0.61818 s, so 2.80005e12 * 128 / 0.61818 / 3.958e15 = 14.648 %. Logged:
   14.648 %.
-- For nanomarin, keep this exact formula when reporting MFU, so numbers compare with levanter's. It omits norms,
+- For marincpp, keep this exact formula when reporting MFU, so numbers compare with levanter's. It omits norms,
   RoPE, the embedding gather and the causal saving.
 
 ## 7. Traps and ambiguities
@@ -480,7 +480,7 @@ MFU[%] = flops_per_example * batch / step_seconds / (n_gpu * 989.5e12) * 100   #
 2. `use_qk_norm: false` is logged, yet QK-norm is on (§2.1). The parameter count confirms it.
 3. `lm_head` and the embedding share PRNG key `k_emb`, so the head starts as `sqrt(D)` × embedding (§4.2).
 4. The flash-attention softmax statistics and accumulator are bf16 with 1024 blocks (§2.3). There are two readings
-   for nanomarin:
+   for marincpp:
    - (a) Bit-exact: replicate levanter's bf16 online softmax (f32-accumulated row sums), block 1024, ascending key
      blocks, bf16(-1e10) fill, bf16-precision L, and the bf16/f32 backward of §2.3.
    - (b) Practical: FA2/FA3/cuDNN with f32 statistics. This is numerically *better* and expected inside seed noise,

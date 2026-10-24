@@ -23,7 +23,7 @@ the EOS token, ordered by a closed form (Threefry block shuffle of 2048, then an
 seed 42) that is pinned by 12 batch hashes. Eval is the full 16-domain Paloma val set in 114 batches of 128, logged
 at step s with the parameters after s + 1 updates, with levanter's token-weighted per-batch bpb estimator. The 130m
 pool (n = 8, W&B) gives c4_en bpb 1.16326 (sd 0.00033) and macro_loss 4.18646 (sd 0.00577); the task text's 1.16327
-(sd 0.00035) and 4.1848 (sd 0.0043, an n = 4 value) are superseded. nanomarin passes stage 1 when it clears the "Parity test
+(sd 0.00035) and 4.1848 (sd 0.0043, an n = 4 value) are superseded. marincpp passes stage 1 when it clears the "Parity test
 plan" at the end: static checks, unit kernels against levanter fixtures, step-0 loss and gradients, the first 200 steps, and
 final metrics inside the pool at no lower throughput.
 
@@ -127,7 +127,7 @@ is `.venv/lib/python3.12/site-packages/jax` (jax 0.11.1).
 | 1_2b | `muonh-qwen3-1_2b-della4xh100` | `cead09a2590b` |
 
 - Cached configs: `cache/wandb/muonh-qwen3-<size>-della4xh100.config.json`, written by `cache/wandb/_tools/fetch_config.py`
-  (paths relative to `project/nanomarin`).
+  (paths relative to `project/marin.cpp`).
 - `git diff --stat <commit> HEAD -- lib/levanter/src/levanter lib/haliax/src/haliax` lists exactly one file for each
   of the four commits: `levanter/trainer.py` (+17 lines, 0 deleted). Every other levanter and haliax file is unchanged,
   including all files this spec cites (qwen.py, llama.py, attention.py, attention_mask.py, flash_attention.py,
@@ -580,7 +580,7 @@ MFU[%] = flops_per_example * batch / step_seconds / (n_gpu * 989.5e12) * 100   #
 - Peak: W&B `throughput/theoretical_flops` = 3.958e15 for 4x "NVIDIA H100 80GB HBM3".
 - Check: the 130m step at `_step` 2 took 0.61818 s, so 2.80005e12 * 128 / 0.61818 / 3.958e15 = 14.648 %. Logged:
   14.648 %.
-- For nanomarin, keep this exact formula when reporting MFU, so numbers compare with levanter's. It omits norms,
+- For marincpp, keep this exact formula when reporting MFU, so numbers compare with levanter's. It omits norms,
   RoPE, the embedding gather and the causal saving.
 
 ### 7. Traps and ambiguities
@@ -589,7 +589,7 @@ MFU[%] = flops_per_example * batch / step_seconds / (n_gpu * 989.5e12) * 100   #
 2. `use_qk_norm: false` is logged, yet QK-norm is on (§2.1). The parameter count confirms it.
 3. `lm_head` and the embedding share PRNG key `k_emb`, so the head starts as `sqrt(D)` × embedding (§4.2).
 4. The flash-attention softmax statistics and accumulator are bf16 with 1024 blocks (§2.3). There are two readings
-   for nanomarin:
+   for marincpp:
    - (a) Bit-exact: replicate levanter's bf16 online softmax (f32-accumulated row sums), block 1024, ascending key
      blocks, bf16(-1e10) fill, bf16-precision L, and the bf16/f32 backward of §2.3.
    - (b) Practical: FA2/FA3/cuDNN with f32 statistics. This is numerically *better* and expected inside seed noise,
@@ -637,7 +637,7 @@ does not change. In the run commits, every `trainer.py` line from HEAD `:749` on
 | `LV` | `lib/levanter/src/levanter` |
 | `HX` | `lib/haliax/src/haliax` |
 | `OX` | `.venv/lib/python3.12/site-packages/optax` (optax 0.2.6; jax 0.11.1, equinox 0.13.2) |
-| `WB` | `$ROOT/project/nanomarin/cache/wandb/api/reself__marin-della__muonh-qwen3-<size>-della4xh100.json` (logged config and summary of the finished runs `reself/marin-della/muonh-qwen3-<size>-della4xh100`) |
+| `WB` | `$ROOT/project/marin.cpp/cache/wandb/api/reself__marin-della__muonh-qwen3-<size>-della4xh100.json` (logged config and summary of the finished runs `reself/marin-della/muonh-qwen3-<size>-della4xh100`) |
 
 The logged W&B configs (`WB` `.config.optimizer`, `.config.trainer`) agree with `L:426-431` and `L:736-755` for all four
 sizes, field by field.
@@ -1002,7 +1002,7 @@ reproduces every row (`run-20260914_123815-...-300m`, `run-20260915_170105-...-5
 
 **Lookup table.** A bit-exact port should not trust its own cos, pow and division here. W&B logs the exact f32
 `optim/learning_rate` and `optim/adam_lr` at `_step` k ≥ 2 (§3 step 3). Load them as a per-k table from the cached
-histories `$ROOT/project/nanomarin/cache/wandb/run-2026091[4-7]_*-muonh-qwen3-<size>-della4xh100.jsonl.gz`
+histories `$ROOT/project/marin.cpp/cache/wandb/run-2026091[4-7]_*-muonh-qwen3-<size>-della4xh100.jsonl.gz`
 (one file per resumed segment; a step re-run after a resume appears once). The table has holes: of k = 2..N−1, 130m
 has all 4957 steps, 300m 11435 of 11442, 520m 9900 of 9916, 1_2b 22822 of 22886 (the missing steps are presumably the
 first steps of resumed segments). Take the holes and k = 0, 1 from the formulas, and check each against its logged
@@ -1058,7 +1058,7 @@ All schedule arithmetic is f32 with an int32 counter. The peaks are f32 rounding
   not carry (the loss section owns this check). The reduction is `sum(w·l) / sum(w)` (`HX/nn/loss.py:132-138`). Every microbatch
   therefore has the same weight sum, 128·4095, and only because of that does `(mb0 + mb1)/2` (`grad_accum.py:157-162`)
   equal the global token mean. A change that makes the sums unequal (padding, ignore ids, document masks) breaks the
-  equivalence. nanomarin can use any microbatch count, at the cost of last-bit differences.
+  equivalence. marincpp can use any microbatch count, at the cost of last-bit differences.
 - Data order (`data_seed = 42`, linear permutation) and init `seed = 0` belong to the data and model sections.
 
 ### 9. Reference pseudo-code (one step, f32)
@@ -1127,7 +1127,7 @@ the two agree. Its outputs are in `cache/data/data_ref.json`. All other facts ci
 
 **Abbreviations.** `M/` = `$ROOT/project/marin` (read-only reference). `L/` =
 `M/lib/levanter/src/levanter`. `J/` = `M/.venv/lib/python3.12/site-packages/jax/_src`. `S/` =
-`$ROOT/marin_store_big`. `N/` = `$ROOT/project/nanomarin`.
+`$ROOT/marin_store_big`. `N/` = `$ROOT/project/marin.cpp`.
 Line numbers are for marin HEAD `1793624070`.
 
 **Code version.** Each run is a chain of resume segments, and each segment logs its own `git_commit`; the run-level
@@ -1667,8 +1667,8 @@ levanter muonh_qwen3 baseline, so `scripts/della/objective_compare.py` runs on i
   `experiments/references/della_muonh_qwen3_scaling.py`.
 - Authoritative values: the W&B runs `reself/marin-della/muonh-qwen3-{130m,300m,520m,1_2b}-della4xh100` (state
   `finished`). The config, the summary and the logging steps are cached in
-  `nanomarin/cache/wandb/api/<run>.meta.json`, written by `cache/wandb/_tools/api_meta.py` on della-vis1. The history
-  of each local run segment is cached in `nanomarin/cache/wandb/run-*.jsonl.gz`.
+  `marincpp/cache/wandb/api/<run>.meta.json`, written by `cache/wandb/_tools/api_meta.py` on della-vis1. The history
+  of each local run segment is cached in `marincpp/cache/wandb/run-*.jsonl.gz`.
 - Default knobs: no VARIANT, EMA_BETA=0, TPP=20, VOCAB_K=0, SEQ_LEN=4096, BATCH=0, SMOKE_STEPS=0, NUM_GPUS=4.
 
 ### 1. Eval schedule
@@ -2165,7 +2165,7 @@ The script reads W&B only. It reads `run.summary` (the last logged value of each
      (lines 163-171). The new stack must emit all 16 and no extra key that matches this pattern.
 4. The current 130m pool: `--pool=,-s1,-s2,-s3,-ema0.999,-ema0.999-s1,-ema0.999-s2,-ema0.999-s3`
    (docs/della/sampled-softmax.md:90). Example readout of four new-stack runs:
-   `.venv/bin/python scripts/della/objective_compare.py --pool=,-s1,-s2,-s3,-ema0.999,-ema0.999-s1,-ema0.999-s2,-ema0.999-s3 --cell=-nm,-nm-s1,-nm-s2,-nm-s3 --name=nanomarin`
+   `.venv/bin/python scripts/della/objective_compare.py --pool=,-s1,-s2,-s3,-ema0.999,-ema0.999-s1,-ema0.999-s2,-ema0.999-s3 --cell=-nm,-nm-s1,-nm-s2,-nm-s3 --name=marincpp`
    (on a vis node, `--flag=value` form).
 
 Optional exact bpb (a need of the Tokenizer Size session, docs/survey/needs_from_sessions.md): log it under a prefix
@@ -2237,7 +2237,7 @@ HEAD, so every library line cited here is the code that ran.
 | `HX` | `lib/haliax/src/haliax` |
 | `CE` | `LV/kernels/pallas/fused_cross_entropy_loss` |
 | `FA` | `LV/models/flash_attention.py` |
-| `NC` | `$ROOT/project/nanomarin/cache` |
+| `NC` | `$ROOT/project/marin.cpp/cache` |
 | `J130` | `NC/hlo/130m/train_step.jaxpr.squeezed.txt`: the 130m baseline's traced train-step jaxpr, written by the run itself on 2026-09-14 04:18 (`logs/muonh-qwen3-130m-della4xh100/artifacts/train_step.jaxpr.txt.gz`, runs of spaces squeezed, line numbers unchanged) |
 | `H<size>` | `NC/hlo/<size>/train_step.hlo.txt`: the lowered StableHLO of each size's train step (pre-optimization, pre-SPMD), copied from `logs/muonh-qwen3-<size>-della4xh100/artifacts/` |
 
@@ -2289,7 +2289,7 @@ changes no gradient that matters, but a bit-level comparison sees it. A rewrite 
 
 ### 1. Classification and summary
 
-* **M (math):** the item changes the function that is computed. nanomarin must reproduce it exactly.
+* **M (math):** the item changes the function that is computed. marincpp must reproduce it exactly.
 * **P (precision):** the item is a rounding point or a dtype. The math is the same, and only the rounding changes. Use
   the reference choice in the parity run. A change that raises precision is allowed after an A/B test shows no effect:
   n >= 4 runs per arm, gates `targets.md` §4(c). A change that lowers precision is not allowed in stage 1.
@@ -2427,7 +2427,7 @@ dx  = bf16(t1 + t2)                              # km, kn: the only rounding of 
 * P: the angle reaches `4095 * inv_freq[0] = 4095` rad. Half a bf16 ulp near 1 is 2^-9 (about 2e-3). A cos/sin
   without full-range argument reduction (CUDA `__cosf`/`__sinf`, `--use_fast_math`) can err by a large fraction of
   that at 4095 rad and flip table entries after the bf16 cast. A 1-ulp difference in an `inv_freq` entry moves the
-  angle at pos 4095 by up to about 2.4e-4 rad and can also flip entries. So nanomarin either uses accurate f32
+  angle at pos 4095 by up to about 2.4e-4 rad and can also flip entries. So marincpp either uses accurate f32
   cos/sin on the f32 angle `f32(f32(pos) * inv_freq)`, with `inv_freq` built in f32 in the order above, or copies the
   exact f32 `inv_freq` and the bf16 cos/sin tables `[4096, hd]` from the reference (O4).
 * The rotation runs in bf16: `q*cos + concat(-q[hd/2:], q[:hd/2])*sin` (`J130:2639-2668`; `rotary.py:17-22, 45`).
@@ -2792,7 +2792,7 @@ The rerun `muonh-qwen3-130m-della4xh100-restore` (2026-09-29) used the same conf
   (`docs/della/objective-hillclimb.md:516, 729`). The throughput cost of determinism is therefore unmeasured.
 * Consequence: the reference alone shows about 1 sd of run-to-run spread. This floor is what makes every P item
   testable only by distribution.
-* For nanomarin, a deterministic embedding backward (sorted segment-sum, f32 accumulator) is S and recommended. It
+* For marincpp, a deterministic embedding backward (sorted segment-sum, f32 accumulator) is S and recommended. It
   makes A/B tests of single P items possible at n = 1 per seed for debugging. Gates still follow `targets.md`.
 
 ### 10. Open items (need a GPU node; nothing was submitted)
@@ -2811,9 +2811,9 @@ The rerun `muonh-qwen3-130m-della4xh100-restore` (2026-09-29) used the same conf
   `precision_config`/algorithm) for Newton-Schulz and the flash `dV`. In the same job, record the loaded libraries
   (`/proc/<pid>/maps` or `LD_DEBUG=libs`) to confirm which `libcublas`, `libcudnn` and `libnccl` builds ran (§0).
 * **O3. Scale of P items.** One A/B at 130m against the 8-run pool: f32 attention softmax and accumulators versus the
-  reference bf16 (§4.5). This is the first deviation nanomarin will want.
+  reference bf16 (§4.5). This is the first deviation marincpp will want.
 * **O4. RoPE tables.** On a GPU node, run the `DefaultRotaryEmbeddings` code path once at hd 64 and hd 128 and save the
-  f32 `inv_freq` and the bf16 cos/sin tables `[4096, hd]` (§3.3). nanomarin either loads them or tests its own tables
+  f32 `inv_freq` and the bf16 cos/sin tables `[4096, hd]` (§3.3). marincpp either loads them or tests its own tables
   against them bit for bit.
 
 ### 11. Findings that belong to other sections (verified while reading)
@@ -2833,7 +2833,7 @@ The rerun `muonh-qwen3-130m-della4xh100-restore` (2026-09-29) used the same conf
 
 Stage-1 spec, section "targets". Written 2026-10-24.
 
-**Summary.** The 130m reference pool has 8 finished levanter H100 runs: c4_en bpb 1.16326 (sd 0.00033), Paloma macro_loss 4.18646 (sd 0.00577). The 300m pool has 5 runs: 1.05641 (sd 0.00029) and 3.81386 (sd 0.00574). 520m and 1_2b have one H100 run each. The four TPU originals ran on **v5litepod-64 (TPU v5e)**, not v5p. nanomarin passes stage 1 when it clears four gates: (a) step-0 loss and gradients, (b) the first 200 steps, (c) final metrics, (d) throughput.
+**Summary.** The 130m reference pool has 8 finished levanter H100 runs: c4_en bpb 1.16326 (sd 0.00033), Paloma macro_loss 4.18646 (sd 0.00577). The 300m pool has 5 runs: 1.05641 (sd 0.00029) and 3.81386 (sd 0.00574). 520m and 1_2b have one H100 run each. The four TPU originals ran on **v5litepod-64 (TPU v5e)**, not v5p. marincpp passes stage 1 when it clears four gates: (a) step-0 loss and gradients, (b) the first 200 steps, (c) final metrics, (d) throughput.
 
 All numbers below come from W&B (cached under `cache/wandb/targets/`). Each table is generated by a script in `cache/wandb/_tools/`, and no value was transcribed by hand. Where the ledgers quote a different value, the W&B value wins, and section 6 lists the conflicts.
 
@@ -3067,23 +3067,23 @@ Pool envelope of `train/loss` (mean, sd, min, max):
 
 ---
 
-### 4. Parity gates for nanomarin stage 1
+### 4. Parity gates for marincpp stage 1
 
 Conventions:
 
 * "levanter-H100" means the reference code run on 4× H100 by `scripts/della/muonh_qwen3_h100x4.sbatch` with default knobs.
 * "bf16 policy" is levanter's `mp: p=f32, c=bf16, out=bf16` (logged config `trainer.mp`).
 * "f32 policy" is the same code with `compute_dtype=f32`.
-* nanomarin logs `train/loss` from step 0 with levanter's meaning: at step k, the loss of batch k under the parameters after k updates. Its periodic evals copy levanter's off-by-one: the eval logged at step s ∈ {1000, 2000, ...} runs after update s (parameters after s + 1 updates), and the final eval, logged at `num_train_steps − 1`, runs after all N updates (section 1, "Step semantics"). In addition it runs one eval **at init, before update 0**, and logs it as the init eval (for a3). That eval is not comparable with the TPU step-0 row at 130m.
+* marincpp logs `train/loss` from step 0 with levanter's meaning: at step k, the loss of batch k under the parameters after k updates. Its periodic evals copy levanter's off-by-one: the eval logged at step s ∈ {1000, 2000, ...} runs after update s (parameters after s + 1 updates), and the final eval, logged at `num_train_steps − 1`, runs after all N updates (section 1, "Step semantics"). In addition it runs one eval **at init, before update 0**, and logs it as the init eval (for a3). That eval is not comparable with the TPU step-0 row at 130m.
 * Optimizer groups (`muonh.py:106-127`; full inventory in `optim.md` §2.2). **muonh**: every transformer `hnn.Linear` weight (q, k, v, o, gate, up, down), stacked over layers. **adamh**: `lm_head.weight`. **adam**: `embeddings.token_embeddings.weight`, every RMSNorm gain (input, post-attention, the two hybrid post-norms, q_norm, k_norm, final norm) and any Linear bias (none exist, `use_bias = False`). The per-group gates below use these three groups.
 
 #### (a) Step-0 loss and gradient agreement on a fixed batch from the same init
 
-**Fixtures.** These are produced by a harness that imports levanter and runs on one GPU node. The harness lives in nanomarin; nothing is added to the marin repo.
+**Fixtures.** These are produced by a harness that imports levanter and runs on one GPU node. The harness lives in marincpp; nothing is added to the marin repo.
 
 1. **Init.** The plain baseline builds the model at `train_lm.py:268`: `state = trainer.initial_state(training_key, model_init=lambda: config.model.build(Vocab, key=model_key))`, with `model_key = split(PRNGKey(0), 4)[2]` (`:217-218`) and `Vocab = round_axis_for_partitioning(Axis("vocab", len(tokenizer)), parameter_axis_mapping)` (`:250-251`). `trainer.initial_state` (`trainer.py:443`) runs `load_checkpoint_or_initialize` with the parameter sharding (`trainer.py:507`), and `TrainerState.init` casts by trainability (`cast_params_by_trainability`, `trainer_state.py:97-98`). (`train_lm.py:142` is the same expression inside `_load_lm_model_from_configured_source`, which runs only for an HF or checkpoint init source; it is not the baseline path.) The harness calls `trainer.initial_state` and saves `state.model`, or it shows that an eager `config.model.build` gives the same bits (this needs `jax_threefry_partitionable = True`, `trainer.py:99`). Save the model as a levanter tensorstore checkpoint. levanter can reload that checkpoint with `initialize_model_from_checkpoint_path` (`train_lm.py:86-92`, `:133-138`), which is also the round-trip check.
 2. **Batch.** Batch 0 is the first `train_batch_size` sequences (128 for 130m/300m, 256 for 520m/1_2b, seq 4096) of exactly `config.data.train_set(Pos, config.trainer.batch_schedule, key=PRNGKey(42))` (`train_lm.py:256-260`, `data_key` overridden at `:222`). Inside it: `mix_key, shuffle_key = split(data_key)` (`data/text/datasets.py:788`); the per-component linear-permutation key is the first key of `key_iterator(shuffle_key)` (`:839-841`); the order then passes through a `MixtureDataset` with `mix_key` and `mixture_block_size` 2048 (`:794-800`). The key values and the closed form are in `data.md` §4.1–4.4. Save the token ids and the attention segment ids (EOS-based document masking) as `.npy`.
-3. **Reference outputs.** Run levanter's loss and gradient at step 0, once with the bf16 policy and once with the f32 policy. Run each policy twice, and measure the levanter-vs-levanter floor `e_floor(T)` for **every** parameter tensor T. The atomic scatter-add makes the embedding floor nonzero, but no run has shown that the other tensors (fused CE backward, attention backward, reductions) are bitwise repeatable (section 3, item 2), so the floor is measured, not assumed. At 520m and 1_2b one optimizer step is 2 microbatches of 32 seqs/GPU (`per_device_parallelism = 32`, launcher `:435`, `:787`). The reference gradient is levanter's accumulated gradient: microbatch j = 0, 1 holds sequences [128j, 128j + 128) of the batch (`grad_accum.py:170-179`), the two gradients are summed in f32 in that order (`grad_accum.py:144`), and each leaf is then divided by 2 (`:157-162`; `optim.md` §8). nanomarin copies that order for a4, or else it uses a4's bound with `e_floor` measured between levanter at 2 × 32 and levanter at another microbatch count.
+3. **Reference outputs.** Run levanter's loss and gradient at step 0, once with the bf16 policy and once with the f32 policy. Run each policy twice, and measure the levanter-vs-levanter floor `e_floor(T)` for **every** parameter tensor T. The atomic scatter-add makes the embedding floor nonzero, but no run has shown that the other tensors (fused CE backward, attention backward, reductions) are bitwise repeatable (section 3, item 2), so the floor is measured, not assumed. At 520m and 1_2b one optimizer step is 2 microbatches of 32 seqs/GPU (`per_device_parallelism = 32`, launcher `:435`, `:787`). The reference gradient is levanter's accumulated gradient: microbatch j = 0, 1 holds sequences [128j, 128j + 128) of the batch (`grad_accum.py:170-179`), the two gradients are summed in f32 in that order (`grad_accum.py:144`), and each leaf is then divided by 2 (`:157-162`; `optim.md` §8). marincpp copies that order for a4, or else it uses a4's bound with `e_floor` measured between levanter at 2 × 32 and levanter at another microbatch count.
 4. **Init eval.** Run levanter's full Paloma eval on the saved init model, before any update, with both policies. This is the a3 reference. The eval set, its order, the 128-sequence eval batch and the zero-weight padding of the last batch (65 real rows, 63 padding rows) are specified in `eval.md` §2.2–2.3 (`trainer.py:1047-1049`, `:1168-1175`; `data/loader.py` `pad_final_batch`).
 
 | id | quantity | pass |
@@ -3093,14 +3093,14 @@ Conventions:
 | a3 | full Paloma eval at init | Each of the 16 domain losses and macro_loss within 1e-4 of the levanter init eval (fixture 4). The bpb of each domain must use the same byte counts as levanter, on the same sequences and padding (`eval.md` §2.2–2.3). The TPU step-0 values (130m: c4_en bpb 3.57218, macro 11.7600) are after one update and are not a reference. |
 | a4 | per-tensor gradient, f32 policy | For each parameter tensor T, relative L2 error ‖g_n − g_l‖/‖g_l‖ ≤ max(1e-5, 2·e_floor(T)), with `e_floor(T)` measured per tensor in fixture 3. |
 | a5 | per-tensor gradient, bf16 policy | Error against the f32-policy levanter gradient ≤ 2× levanter's own bf16-vs-f32 error, tensor by tensor. Cosine ≥ 0.9999 for every tensor. |
-| a6 | per-group gradient norms before clipping | Each group has its own clip (`muonh.py:64-65`, `:81-82`, `:89-90`). `optax.multi_transform` (`:102`) gives each chain the tree with the other groups' leaves replaced by empty `MaskedNode`s (`optax/transforms/_combining.py:265,278`; `_masking.py:31,92`), so each `clip_by_global_norm` sums only its own group (`optim.md` §3.1). Compare the three pre-clip norms ‖g_muonh‖, ‖g_adamh‖ and ‖g_adam‖ (groups in the conventions above): relative difference ≤ 1e-4 for each. Each group G is scaled by min(1, max_grad_norm/‖g_G‖) with `max_grad_norm` 1.0 (2.0 for 1_2b). A single norm over all parameters (the logged `grad/norm/total`) fixes none of the three clip factors, and nanomarin must clip each group separately. |
-| a7 | optimizer steps | **130m** (lr 0.02 / adam_lr 0.008 at update 0, no warmup): run update 0. Per-tensor parameter-update relative error ≤ 2× levanter's bf16-vs-f32 floor. The step-1 loss must agree with levanter-H100 to ≤ 2e-3; 2e-3 is about 2× the largest same-seed H100 step-2 \|d\|, which is 1.19e-3. **300m, 520m, 1_2b** (warmup 1000): the warmup is `optax.linear_schedule(0.0, peak, 1000)` (`optim/config.py:307`, `:317-318`) for both `learning_rate` and `adam_lr` (`muonh.py:58-59`), and `inject_hyperparams` evaluates it at count 0 for update 0 (`muonh.py:104`; `optim.md` §3, step 3). So lr = adam_lr = 0 at update 0. The Adam group applies `scale(-0)`, an exact zero. MuonH and AdamH apply `norm_preserving_update(p, u, 0)`, which returns `new/‖new‖·‖p‖ − p` with `new = p` (`optim/util.py:312-315` for the unstacked 2-D `lm_head`; `:317-322` per layer for the stacked MuonH weights, with the `_NORM_FLOOR` in the final division). That is a rounding-level renormalization, not 0 (`optim.md` §4.4). The update-0 relative error is therefore noise over noise and is not gated. Instead: (i) after update 0, compare the optimizer state (MuonH momentum buffer, AdamH and Adam mu and nu, count) per tensor at ≤ max(1e-5, 2·e_floor); (ii) compare the parameters after update 0 bitwise or to 1 ulp, which needs nanomarin to run the renormalization at lr = 0 and not skip it; (iii) run update 1 at lr(1) = (0 − peak)·(1 − 1/1000) + peak (peak 0.01 at all three sizes, so ≈ 1.0e-5 in f32; adam_lr(1) ≈ adam_lr/1000 by the same form, `optim.md` §6.2) and gate its per-tensor update error at 2× levanter's bf16-vs-f32 floor; (iv) the step-1 loss checks the init on batch 1 (≤ 1e-4 against levanter-H100), and the step-2 loss checks update 1 (≤ 1e-4). TPU step-0 / step-1 / step-2 losses: 12.24542 / 12.25557 / 12.24745 (300m), 12.26019 / 12.25711 / 12.23668 (520m), 12.25425 / 12.25591 / 12.21986 (1_2b); 130m step 1: 11.56827. **Trap (all sizes):** the logged config has `weight_decay: 0.1` (`cache/wandb/targets/della__muonh-qwen3-130m-della4xh100.config.json:437`; launcher `:747`), but `MuonHConfig.build` never applies weight decay (`muonh.py:54-104`; `optim.md` §7). nanomarin must apply none. At 130m a7 catches a stray decay at update 0; at 300m+ only part (iii) can. |
+| a6 | per-group gradient norms before clipping | Each group has its own clip (`muonh.py:64-65`, `:81-82`, `:89-90`). `optax.multi_transform` (`:102`) gives each chain the tree with the other groups' leaves replaced by empty `MaskedNode`s (`optax/transforms/_combining.py:265,278`; `_masking.py:31,92`), so each `clip_by_global_norm` sums only its own group (`optim.md` §3.1). Compare the three pre-clip norms ‖g_muonh‖, ‖g_adamh‖ and ‖g_adam‖ (groups in the conventions above): relative difference ≤ 1e-4 for each. Each group G is scaled by min(1, max_grad_norm/‖g_G‖) with `max_grad_norm` 1.0 (2.0 for 1_2b). A single norm over all parameters (the logged `grad/norm/total`) fixes none of the three clip factors, and marincpp must clip each group separately. |
+| a7 | optimizer steps | **130m** (lr 0.02 / adam_lr 0.008 at update 0, no warmup): run update 0. Per-tensor parameter-update relative error ≤ 2× levanter's bf16-vs-f32 floor. The step-1 loss must agree with levanter-H100 to ≤ 2e-3; 2e-3 is about 2× the largest same-seed H100 step-2 \|d\|, which is 1.19e-3. **300m, 520m, 1_2b** (warmup 1000): the warmup is `optax.linear_schedule(0.0, peak, 1000)` (`optim/config.py:307`, `:317-318`) for both `learning_rate` and `adam_lr` (`muonh.py:58-59`), and `inject_hyperparams` evaluates it at count 0 for update 0 (`muonh.py:104`; `optim.md` §3, step 3). So lr = adam_lr = 0 at update 0. The Adam group applies `scale(-0)`, an exact zero. MuonH and AdamH apply `norm_preserving_update(p, u, 0)`, which returns `new/‖new‖·‖p‖ − p` with `new = p` (`optim/util.py:312-315` for the unstacked 2-D `lm_head`; `:317-322` per layer for the stacked MuonH weights, with the `_NORM_FLOOR` in the final division). That is a rounding-level renormalization, not 0 (`optim.md` §4.4). The update-0 relative error is therefore noise over noise and is not gated. Instead: (i) after update 0, compare the optimizer state (MuonH momentum buffer, AdamH and Adam mu and nu, count) per tensor at ≤ max(1e-5, 2·e_floor); (ii) compare the parameters after update 0 bitwise or to 1 ulp, which needs marincpp to run the renormalization at lr = 0 and not skip it; (iii) run update 1 at lr(1) = (0 − peak)·(1 − 1/1000) + peak (peak 0.01 at all three sizes, so ≈ 1.0e-5 in f32; adam_lr(1) ≈ adam_lr/1000 by the same form, `optim.md` §6.2) and gate its per-tensor update error at 2× levanter's bf16-vs-f32 floor; (iv) the step-1 loss checks the init on batch 1 (≤ 1e-4 against levanter-H100), and the step-2 loss checks update 1 (≤ 1e-4). TPU step-0 / step-1 / step-2 losses: 12.24542 / 12.25557 / 12.24745 (300m), 12.26019 / 12.25711 / 12.23668 (520m), 12.25425 / 12.25591 / 12.21986 (1_2b); 130m step 1: 11.56827. **Trap (all sizes):** the logged config has `weight_decay: 0.1` (`cache/wandb/targets/della__muonh-qwen3-130m-della4xh100.config.json:437`; launcher `:747`), but `MuonHConfig.build` never applies weight decay (`muonh.py:54-104`; `optim.md` §7). marincpp must apply none. At 130m a7 catches a stray decay at update 0; at 300m+ only part (iii) can. |
 
 Gate (a) runs for every size. At 130m update 0 is the decisive test of the optimizer: the full LR applies from update 0, so the step-1 loss exercises MuonH, Newton–Schulz, the Hyperball projection, the AdamH lm_head and the Adam embedding/norms all at once. At 300m and above the same test is update 1 (a7 part iii), at 1/1000 of the peak LR.
 
 #### (b) First 200 steps of train/loss
 
-nanomarin starts from the levanter seed-0 init and uses the same data order. It is compared step by step with the H100 seed-0 run `muonh-qwen3-<size>-della4xh100`, on the statistics of section 3.3 over steps 2–200.
+marincpp starts from the levanter seed-0 init and uses the same data order. It is compared step by step with the H100 seed-0 run `muonh-qwen3-<size>-della4xh100`, on the statistics of section 3.3 over steps 2–200.
 
 | size | pass (no worse than TPU vs H100) | strong pass (no worse than H100 same seed) | fail signature (a different seed) |
 |---|---|---|---|
@@ -3110,13 +3110,13 @@ nanomarin starts from the levanter seed-0 init and uses the same data order. It 
 | 1_2b | max \|d\| 2–20 ≤ 0.004, rms ≤ 0.005, win10 ≤ 0.010 | – | – |
 
 * **300m is the most informative size for this gate.** Its warmup keeps a correct implementation within 3e-3 for 20 steps, whereas at 130m the curves separate at the bf16 noise level from step 2.
-* **Envelope check.** This is a secondary check, and the only one available if nanomarin uses its own init. At 130m, the fraction of steps 2–200 outside the n = 8 pool [min, max] must be ≤ 0.50, and \|mean(nano − pool mean) over 100–200\| ≤ 0.035. Both bounds are the worst leave-one-out values of the pool members: 0.48 and 0.032 (`_tools/targets_analyze.out`, `LOO 130m`). At 300m the n = 5 pool is too tight after step 150 (sd 0.0023, LOO outside-fraction up to 0.87), so only the seed-matched test above applies there.
+* **Envelope check.** This is a secondary check, and the only one available if marincpp uses its own init. At 130m, the fraction of steps 2–200 outside the n = 8 pool [min, max] must be ≤ 0.50, and \|mean(nano − pool mean) over 100–200\| ≤ 0.035. Both bounds are the worst leave-one-out values of the pool members: 0.48 and 0.032 (`_tools/targets_analyze.out`, `LOO 130m`). At 300m the n = 5 pool is too tight after step 150 (sd 0.0023, LOO outside-fraction up to 0.87), so only the seed-matched test above applies there.
 
 #### (c) Final metrics within the pool
 
 Metrics: `c4_en bpb`, `eval/paloma/macro_loss`, `eval/paloma/macro_bpb`, plus the 16 domain losses. Every value is read at step `num_train_steps − 1`. A run is admitted only when its last eval is at that step (this guard exists because of the summary-of-a-running-run error, `scripts/della/objective_compare.py`).
 
-**c1, single-run screen (every nanomarin run).** The value must lie inside the pool's 99 % prediction interval, mean ± t₀.₉₉₅,ₙ₋₁ · sd · √(1 + 1/n):
+**c1, single-run screen (every marincpp run).** The value must lie inside the pool's 99 % prediction interval, mean ± t₀.₉₉₅,ₙ₋₁ · sd · √(1 + 1/n):
 
 | size | pool n | half-width | c4_en bpb | macro_loss | macro_bpb |
 |---|---|---|---|---|---|
@@ -3125,7 +3125,7 @@ Metrics: `c4_en bpb`, `eval/paloma/macro_loss`, `eval/paloma/macro_bpb`, plus th
 | 520m | 1 | √2 · 2.576 · sd₃₀₀ₘ (borrowed) | 0.98830 ± 0.0011 | 3.57255 ± 0.021 | 1.29952 ± 0.008 |
 | 1_2b | 1 | same | 0.92763 ± 0.0011 | 3.36087 ± 0.021 | 1.22578 ± 0.008 |
 
-**c2, acceptance (130m and 300m).** Run n_nano = 4 nanomarin runs with seeds 0–3. Two tests apply to each of the three headline metrics:
+**c2, acceptance (130m and 300m).** Run n_nano = 4 marincpp runs with seeds 0–3. Two tests apply to each of the three headline metrics:
 
 * Welch's two-sample t-test against the pool, two-sided at α = 0.05: must **not** reject.
 * TOST equivalence at α = 0.05 with margin δ = 2 pool sd: must **pass**.
@@ -3139,7 +3139,7 @@ Metrics: `c4_en bpb`, `eval/paloma/macro_loss`, `eval/paloma/macro_bpb`, plus th
 * **Escalation.** If Welch does not reject but TOST fails, add 4 more runs (n_nano = 8). The per-metric pass probability then rises to the n_nano = 8 figures above.
 * **Per domain.** No domain loss may differ from the pool at Bonferroni α = 0.05/16 = 0.0031 (Welch). Against the TPU originals, compare loss only (section 3.1).
 
-**c3 (520m, 1_2b).** One nanomarin run must pass the c1 screen against the single levanter-H100 run. The verdict stays provisional until the levanter pool reaches n ≥ 4 at that size. That costs about 18.5 h of 4× H100 per 520m run and about 50 h per 1_2b run. The TPU original is a second draw for c4_en and the domain losses only.
+**c3 (520m, 1_2b).** One marincpp run must pass the c1 screen against the single levanter-H100 run. The verdict stays provisional until the levanter pool reaches n ≥ 4 at that size. That costs about 18.5 h of 4× H100 per 520m run and about 50 h per 1_2b run. The TPU original is a second draw for c4_en and the domain losses only.
 
 #### (d) Throughput
 
@@ -3154,9 +3154,9 @@ All three throughput numbers below use one definition: p50 of the per-step `toke
 
 The H100 values are pool means at 130m and 300m (run-to-run sd 1584 and 243 tok/s) and single runs at 520m and 1_2b.
 
-* **Gate.** nanomarin is no slower than levanter-H100 at any size. The 1.5× goal brings the H100 MFU up to the TPU-original level.
+* **Gate.** marincpp is no slower than levanter-H100 at any size. The 1.5× goal brings the H100 MFU up to the TPU-original level.
 * **Wall clock.** Report end-to-end time as well. Reference: the 130m s0 job took 3441 s (`sacct`), against 4959 × 0.6305 = 3127 s of pure stepping. The remaining ≈ 314 s is compile, five full Paloma evals and checkpoints.
-* **Peak memory is not recorded by the reference.** The sbatch preallocates 90 % of each GPU (`XLA_PYTHON_CLIENT_MEM_FRACTION=0.9`, `scripts/della/muonh_qwen3_h100x4.sbatch:28`). The W&B system metric `memoryAllocatedBytes` (max 7.94e10 B, 92.9 %) therefore shows the preallocation, not the working set. Known limit: 520m at 64 seqs/GPU in one microbatch failed with an extra 35.45 GiB allocation (`kaiyue_muonh_qwen3_h100x4.yaml:53`), which is why 520m and 1_2b use 2 × 32. nanomarin must log the true peak (for example `torch.cuda.max_memory_allocated` or the XLA memory stats) for each size. There is no reference number to beat.
+* **Peak memory is not recorded by the reference.** The sbatch preallocates 90 % of each GPU (`XLA_PYTHON_CLIENT_MEM_FRACTION=0.9`, `scripts/della/muonh_qwen3_h100x4.sbatch:28`). The W&B system metric `memoryAllocatedBytes` (max 7.94e10 B, 92.9 %) therefore shows the preallocation, not the working set. Known limit: 520m at 64 seqs/GPU in one microbatch failed with an extra 35.45 GiB allocation (`kaiyue_muonh_qwen3_h100x4.yaml:53`), which is why 520m and 1_2b use 2 × 32. marincpp must log the true peak (for example `torch.cuda.max_memory_allocated` or the XLA memory stats) for each size. There is no reference number to beat.
 
 ---
 
@@ -3198,14 +3198,14 @@ T2 to T6 restate `targets.md` §4 (Part 6) with the fixture recipe added; T0 and
 - **Metric.** `rel(a, b) = ||a - b||_2 / ||b||_2`, computed in float64 over one tensor. "ulp" is the unit in the last
   place of the reference value in its own dtype.
 - **Oracle rule** (for ops whose rounding is class P in `numerics.md` §1). For each output tensor, compute an f64
-  oracle from the same inputs upcast to f64. Pass if (i) `rel(nano, oracle) <= 1.25 x rel(lev, oracle)`: nanomarin
-  is not less accurate than levanter, with 25% slack for accumulation order; and, when nanomarin claims the
+  oracle from the same inputs upcast to f64. Pass if (i) `rel(nano, oracle) <= 1.25 x rel(lev, oracle)`: marincpp
+  is not less accurate than levanter, with 25% slack for accumulation order; and, when marincpp claims the
   bit-faithful reading (a) of `model.md` §7 item 4, also (ii) `rel(nano, lev) <= rel(lev, oracle)`: the port differs
   from levanter by less than levanter's own rounding error.
-- **Levanter fixtures.** A harness in nanomarin, `tools/levref/` (not written yet), imports levanter read-only from
+- **Levanter fixtures.** A harness in marincpp, `tools/levref/` (not written yet), imports levanter read-only from
   `$ROOT/project/marin/.venv`, builds the plain-baseline `TrainLmConfig` the way the launcher
   does (`della_muonh_qwen3_scaling.py:736-820`) with the **full** `num_train_steps`, and writes `.npy` and JSON files to
-  `$ROOT/project/nanomarin/cache/levref/<size>/`. It never writes into the marin tree.
+  `$ROOT/project/marin.cpp/cache/levref/<size>/`. It never writes into the marin tree.
   - Never use the launcher's `SMOKE_STEPS` for a reference: it sets `num_train_steps`, so it changes the decay length
     (130m: `int(0.8 x N)`), the cosine `T_d`, `steps_per_eval` and `max_eval_batches=1`
     (`della_muonh_qwen3_scaling.py:788-790`).
@@ -3213,7 +3213,7 @@ T2 to T6 restate `targets.md` §4 (Part 6) with the fixture recipe added; T0 and
     T1 and 4 GPUs for T2 and T3 (4-way sharding and 32 sequences per GPU reproduce the CE tiles and reduction layout),
     `--time` at most 00:30:00, `TMPDIR` under `$ROOT/tmp/job/$SLURM_JOB_ID`, no W&B.
   - CPU work and every W&B read run on `ssh della-vis1 'nice -n 19 $ROOT/project/marin/.venv/bin/python ...'`.
-- **nanomarin runs.** Runs of 30 min or less (T1-T4) also go to pli-cp. Full training runs (T5, T6) go to pli-short
+- **marincpp runs.** Runs of 30 min or less (T1-T4) also go to pli-cp. Full training runs (T5, T6) go to pli-short
   through `tools/wq/wq submit`, with `--partial` for any run over 3 h.
 
 ### T0. Static checks (CPU, della-vis1, no GPU)
@@ -3268,13 +3268,13 @@ after all 4959 updates). Levanter's own eval of it is in `checkpoints/eval_metri
 
 | id | check | pass | levanter-side reference |
 |---|---|---|---|
-| T3.1 | Aggregation only (`eval.md` §8 test 2): levanter's per-position losses fed to nanomarin's aggregator | all 42 keys of `eval.md` §4.2 within 2 float32 ulp of levanter's values; the 16 `bpb_k`, `eval/bpb` and `eval/paloma/bpb` match under domain order A (`eval.md` §2.3) | harness dumps `per_pos_loss`, weights, target ids and tags for all 114 batches with `compute_next_token_loss(reduction=None)` on that checkpoint, and runs levanter's evaluator once |
-| T3.2 | End to end (`eval.md` §8 test 3): nanomarin loads the checkpoint and evaluates | each domain loss within 2e-4 nats; c4_en bpb within 1e-4; macro_loss within 2e-4 (every bound is below 0.35 pool sd of its metric) | the same levanter eval (T3.1) |
-| T3.3 | Logging contract (`eval.md` §8 test 4): 25-step nanomarin run, `steps_per_eval` 10, scratch W&B project | eval rows at steps 10, 20, 24; `train/loss` from step 2 (nanomarin may also log steps 0 and 1); norms at 10, 20; `summary._step` = 24; state `finished`; `config.trainer.num_train_steps` = 25; `objective_compare.collect()` admits it; exactly the 16 domain-loss keys match `^eval/paloma/(.+)-marin-tokenizer/loss$` | `scripts/della/objective_compare.py` on della-vis1 |
+| T3.1 | Aggregation only (`eval.md` §8 test 2): levanter's per-position losses fed to marincpp's aggregator | all 42 keys of `eval.md` §4.2 within 2 float32 ulp of levanter's values; the 16 `bpb_k`, `eval/bpb` and `eval/paloma/bpb` match under domain order A (`eval.md` §2.3) | harness dumps `per_pos_loss`, weights, target ids and tags for all 114 batches with `compute_next_token_loss(reduction=None)` on that checkpoint, and runs levanter's evaluator once |
+| T3.2 | End to end (`eval.md` §8 test 3): marincpp loads the checkpoint and evaluates | each domain loss within 2e-4 nats; c4_en bpb within 1e-4; macro_loss within 2e-4 (every bound is below 0.35 pool sd of its metric) | the same levanter eval (T3.1) |
+| T3.3 | Logging contract (`eval.md` §8 test 4): 25-step marincpp run, `steps_per_eval` 10, scratch W&B project | eval rows at steps 10, 20, 24; `train/loss` from step 2 (marincpp may also log steps 0 and 1); norms at 10, 20; `summary._step` = 24; state `finished`; `config.trainer.num_train_steps` = 25; `objective_compare.collect()` admits it; exactly the 16 domain-loss keys match `^eval/paloma/(.+)-marin-tokenizer/loss$` | `scripts/della/objective_compare.py` on della-vis1 |
 
-### T4. First 200 steps (`targets.md` gate (b); 300m, then 130m; nanomarin on pli-cp)
+### T4. First 200 steps (`targets.md` gate (b); 300m, then 130m; marincpp on pli-cp)
 
-nanomarin starts from the T1.1 levanter init, reads the T0.1 data order, uses the full-N schedule and runs 200
+marincpp starts from the T1.1 levanter init, reads the T0.1 data order, uses the full-N schedule and runs 200
 updates. It logs `train/loss` with levanter's meaning (loss of batch k under the parameters after k updates).
 
 | size | pass | strong pass | levanter-side reference |
@@ -3289,7 +3289,7 @@ A different seed shows as win10 >= 0.048 at both sizes (fail signature).
 | id | check | pass | levanter-side reference |
 |---|---|---|---|
 | T5.1 | c1: one seed-0 run, values at step 4958 | c4_en bpb in [1.16204, 1.16449], macro_loss in [4.16504, 4.20788], macro_bpb in [1.50581, 1.52177] | the n = 8 pool of `targets.md` §2 (8 finished W&B runs) |
-| T5.2 | c2: seeds 0-3 | for c4_en bpb, macro_loss, macro_bpb: Welch two-sided alpha 0.05 does not reject, and TOST alpha 0.05 with margins 0.00066 / 0.0115 / 0.0043 passes; if Welch passes and TOST fails, add seeds 4-7. Per domain: no Welch rejection at alpha 0.05/16 | on della-vis1: `.venv/bin/python scripts/della/objective_compare.py --pool=,-s1,-s2,-s3,-ema0.999,-ema0.999-s1,-ema0.999-s2,-ema0.999-s3 --cell=-nm,-nm-s1,-nm-s2,-nm-s3 --name=nanomarin` (run ids `muonh-qwen3-130m-della4xh100-nm[-s<k>]` in `reself/marin-della`, `eval.md` §7) |
+| T5.2 | c2: seeds 0-3 | for c4_en bpb, macro_loss, macro_bpb: Welch two-sided alpha 0.05 does not reject, and TOST alpha 0.05 with margins 0.00066 / 0.0115 / 0.0043 passes; if Welch passes and TOST fails, add seeds 4-7. Per domain: no Welch rejection at alpha 0.05/16 | on della-vis1: `.venv/bin/python scripts/della/objective_compare.py --pool=,-s1,-s2,-s3,-ema0.999,-ema0.999-s1,-ema0.999-s2,-ema0.999-s3 --cell=-nm,-nm-s1,-nm-s2,-nm-s3 --name=marincpp` (run ids `muonh-qwen3-130m-della4xh100-nm[-s<k>]` in `reself/marin-della`, `eval.md` §7) |
 | T5.3 | d: throughput, same runs | p50 tokens/s over steps >= 20, eval steps excluded, >= 830,000 on 4x H100 (goal 1,245,000); MFU by levanter's formula; true peak memory logged | `targets.md` §4(d) table |
 
 ### T6. Larger sizes

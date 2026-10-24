@@ -1,6 +1,6 @@
 # Speed findings handed over by the pretrain sessions
 
-Owner 2026-10-24: pls and Tokenizer Size keep running the old code; they hand their speed findings to nanomarin, which turns them into the design and verifies what needs verifying.
+Owner 2026-10-24: pls and Tokenizer Size keep running the old code; they hand their speed findings to marincpp, which turns them into the design and verifies what needs verifying.
 
 ## pls (received 2026-10-24)
 
@@ -37,6 +37,18 @@ What pls needs most from the stack:
 - Slowest: 48 full-vocab readouts. Wanted: a multi-head CE whose memory does not grow linearly with the number of readouts (head gradients accumulated in place in their shard, no full f32 copy) and that takes one numeric path for every microbatch size.
 - Hard or impossible today: per-layer, per-tensor statistics (residual norms, source weights, grad norms) without host syncs; reading intermediate activations in hooks instead of separate probe programs; predictable memory (a temp estimate before compiling, not trial and error on microbatch and mem fraction); several variants in one program (separate heads and probes sharing one trunk forward); a resumable smoke gate consistent with the compile cache; segment-billed, interruptible training (auto checkpoint before the time limit).
 
-## Tokenizer Size
+## Tokenizer Size (received 2026-10-24)
 
-Pending: summary at project/marin docs/della/speed-workflow.md when wf_cb88f9ae-72b ends; branches in $ROOT/tmp/speed_wt/.
+Full table: $ROOT/project/marin/docs/della/speed-workflow.md (commit 4ded3c868a, branch vocab-overfitting). Raw agent outputs: the journal of workflow wf_cb88f9ae-72b in the Tokenizer Size session. Worktrees: $ROOT/tmp/speed_wt/. All speed numbers come from shared A40/A100 vis GPUs or are estimated from logs; none is an H100 measurement. Not switched on or A/B-tested in current runs (owner).
+
+1. Charwin slowdown cause: the flash block falls to 128 when SEQ_LEN is not a multiple of 1024 (della_muonh_qwen3_scaling.py:112). The pure-JAX flash (lib/levanter/src/levanter/models/flash_attention.py) is nested lax.while_loops with a fixed cost of ~32 us per iteration: ~21.4k iterations per step against ~0.5k. Fix in levanter: the largest divisor of SEQ_LEN <= 1024 and a multiple of 32 (4224->704, 4480->896, 4992->832, 5504->688): attention per layer -33 to -38% (A40); estimated charwin step 2.5 -> ~1.45 s. Numerics: reordering-level.
+2. Attention is ~55% of the 300m step at 4096 (linear+quadratic fit of 4096 vs 19456 step times). Full per-layer remat (LlamaConfig gradient_checkpointing=True, llama.py:80-81, haliax ScanCheckpointPolicy(simple=True)) runs the flash forward twice. Peak memory 12.3-13.0 of 71 GiB on every run.
+3. Built on branches, adversarially reviewed, NOT yet harmless:
+   (a) FA4/CuTe segmented backend, speed-fa4-segmented-attention-backend 6497ef5720 (layers/attention.py -> grug/attention/_fa4_cute.py). Fwd 6-12x faster than JAX flash; full 300m fwd 2.0x faster at 4096 (A40). Error vs f32 equal or lower than JAX flash on sm80. The sm90 backward never ran: head_dim 64 goes through the generic launcher.
+   (b) Saving flash residuals in remat (REMAT=flash), speed-save-flash-residuals-remat 444ea137bf: -15% at 4096, -26% at 4224 (A40); +2.5 GiB/device at 300m; bf16 grads differ 1.1-1.7% rel L2, distance to f32 unchanged.
+   (c) CUDA-graph while loops (--xla_gpu_enable_command_buffer=+WHILE,+CONDITIONAL), speed-command-buffer-while fe5a177339: same kernels; step-0 grads 158/159 leaves bitwise on A40; A40 timing was noise; estimated gain up to 30% for loop-bound charwin.
+4. Small items, 0.5-3% each: XLA CE fast backward, balanced vocab blocks. Note: the current 128K H100 CE gradient has relative error 2e-2 vs f32, 5-20x the XLA path. Also: collective-overlap flags, SIGTERM checkpoint, per-step host sync. Collectives ~1% of the step. Non-step overhead 3.5-5.5% of wall time (Paloma eval 3.5%). Head + CE is 17-19% of the step at 128K and 2% at 8K.
+5. Rejected: pure data parallelism (0%), no remat + microbatching (-5%).
+6. Not tested anywhere: H100 timing and numerics, multi-GPU FSDP numerics, a full-schedule same-seed A/B (planned A/Bs covered ~20% of the schedule), memory at 520m/1_2b.
+
+What it means for marin.cpp: attention must be a real fused kernel at every SEQ_LEN (no block-size cliff); no remat by default (memory headroom 5x); the levanter 128K CE gradient is 2e-2 rel off f32, so the parity plan's oracle rule (not bitwise CE) is the right gate for CE.

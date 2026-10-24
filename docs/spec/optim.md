@@ -27,7 +27,7 @@ does not change. In the run commits, every `trainer.py` line from HEAD `:749` on
 | `LV` | `lib/levanter/src/levanter` |
 | `HX` | `lib/haliax/src/haliax` |
 | `OX` | `.venv/lib/python3.12/site-packages/optax` (optax 0.2.6; jax 0.11.1, equinox 0.13.2) |
-| `WB` | `$ROOT/project/nanomarin/cache/wandb/api/reself__marin-della__muonh-qwen3-<size>-della4xh100.json` (logged config and summary of the finished runs `reself/marin-della/muonh-qwen3-<size>-della4xh100`) |
+| `WB` | `$ROOT/project/marin.cpp/cache/wandb/api/reself__marin-della__muonh-qwen3-<size>-della4xh100.json` (logged config and summary of the finished runs `reself/marin-della/muonh-qwen3-<size>-della4xh100`) |
 
 The logged W&B configs (`WB` `.config.optimizer`, `.config.trainer`) agree with `L:426-431` and `L:736-755` for all four
 sizes, field by field.
@@ -392,7 +392,7 @@ reproduces every row (`run-20260914_123815-...-300m`, `run-20260915_170105-...-5
 
 **Lookup table.** A bit-exact port should not trust its own cos, pow and division here. W&B logs the exact f32
 `optim/learning_rate` and `optim/adam_lr` at `_step` k ≥ 2 (§3 step 3). Load them as a per-k table from the cached
-histories `$ROOT/project/nanomarin/cache/wandb/run-2026091[4-7]_*-muonh-qwen3-<size>-della4xh100.jsonl.gz`
+histories `$ROOT/project/marin.cpp/cache/wandb/run-2026091[4-7]_*-muonh-qwen3-<size>-della4xh100.jsonl.gz`
 (one file per resumed segment; a step re-run after a resume appears once). The table has holes: of k = 2..N−1, 130m
 has all 4957 steps, 300m 11435 of 11442, 520m 9900 of 9916, 1_2b 22822 of 22886 (the missing steps are presumably the
 first steps of resumed segments). Take the holes and k = 0, 1 from the formulas, and check each against its logged
@@ -448,7 +448,7 @@ All schedule arithmetic is f32 with an int32 counter. The peaks are f32 rounding
   not carry (the loss section owns this check). The reduction is `sum(w·l) / sum(w)` (`HX/nn/loss.py:132-138`). Every microbatch
   therefore has the same weight sum, 128·4095, and only because of that does `(mb0 + mb1)/2` (`grad_accum.py:157-162`)
   equal the global token mean. A change that makes the sums unequal (padding, ignore ids, document masks) breaks the
-  equivalence. nanomarin can use any microbatch count, at the cost of last-bit differences.
+  equivalence. marincpp can use any microbatch count, at the cost of last-bit differences.
 - Data order (`data_seed = 42`, linear permutation) and init `seed = 0` belong to the data and model sections.
 
 ## 9. Reference pseudo-code (one step, f32)

@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""devq: run many short GPU tasks inside ONE interactive allocation (owner rule: debug and tests use one
+pli-cp salloc, released as soon as the work ends; never one Slurm job per test).
+
+  devq.py submit --gpus N --name NAME [--cwd DIR] -- CMD...   queue a task; prints its id (CMD is joined
+                                                               with spaces: put anything with quotes in a script)
+  devq.py wait ID [ID...]                                      block until done; print rc and log path
+  devq.py ls                                                   pending / running / done
+  devq.py runner --gpus G [--idle-exit 1200]                   run inside the allocation (srun --overlap)
+
+Queue directory: $DEVQ_DIR (default $NANOMARIN_ROOT/tmp/devq). The runner gives each task its own GPUs via
+CUDA_VISIBLE_DEVICES, a per-task TMPDIR on scratch, `module load proxy/default` and HF offline env.
+When nothing is pending or running for --idle-exit seconds, the runner cancels its own allocation, so GPUs
+never sit idle long enough for the 30-min idle warning.
+"""
+import argparse, json, os, subprocess, sys, time
+
+ROOT = os.environ.get("NANOMARIN_ROOT")
+if not ROOT:
+    sys.exit("set NANOMARIN_ROOT")
+QDIR = os.environ.get("DEVQ_DIR", os.path.join(ROOT, "tmp", "devq"))
+SUB = {k: os.path.join(QDIR, k) for k in ("pending", "running", "done")}
+
+
+def _mk():
+    for d in SUB.values():
+        os.makedirs(d, exist_ok=True)
+
+
+def _next_id():
+    path = os.path.join(QDIR, "counter")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT)
+    import fcntl
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    raw = os.read(fd, 32)
+    n = int(raw or b"0") + 1
+    os.lseek(fd, 0, 0)
+    os.ftruncate(fd, 0)
+    os.write(fd, str(n).encode())
+    os.close(fd)
+    return f"t{n}"
+
+
+def submit(a):
+    _mk()
+    tid = _next_id()
+    task = {"id": tid, "name": a.name, "gpus": a.gpus, "cwd": os.path.abspath(a.cwd), "cmd": a.cmd,
+            "submitted": time.time()}
+    tmp = os.path.join(SUB["pending"], f".{tid}.json")
+    with open(tmp, "w") as f:
+        json.dump(task, f)
+    os.rename(tmp, os.path.join(SUB["pending"], f"{tid}.json"))
+    print(tid)
+
+
+def _state(tid):
+    for k in ("done", "running", "pending"):
+        p = os.path.join(SUB[k], f"{tid}.json")
+        if os.path.exists(p):
+            return k, json.load(open(p))
+    return None, None
+
+
+def wait(a):
+    left = set(a.ids)
+    while left:
+        for tid in sorted(left):
+            k, t = _state(tid)
+            if k == "done":
+                print(f"{tid} {t['name']} rc={t['rc']} log={t['log']} secs={t['end'] - t['start']:.0f}")
+                left.discard(tid)
+            elif k is None:
+                print(f"{tid} unknown")
+                left.discard(tid)
+        if left:
+            time.sleep(10)
+
+
+def ls(a):
+    _mk()
+    for k in ("pending", "running", "done"):
+        for fn in sorted(os.listdir(SUB[k])):
+            if fn.endswith(".json") and not fn.startswith("."):
+                t = json.load(open(os.path.join(SUB[k], fn)))
+                print(k, t["id"], t["name"], f"gpus={t['gpus']}", f"rc={t.get('rc', '')}", t.get("devices", ""))
+
+
+def runner(a):
+    _mk()
+    job = os.environ.get("SLURM_JOB_ID", "nojob")
+    free = list(range(a.gpus))
+    procs = {}  # tid -> (Popen, task, devices)
+    idle_since = time.time()
+    while True:
+        # reap
+        for tid, (p, t, devs) in list(procs.items()):
+            rc = p.poll()
+            if rc is None:
+                continue
+            t.update(rc=rc, end=time.time())
+            with open(os.path.join(SUB["done"], f"{tid}.json"), "w") as f:
+                json.dump(t, f)
+            os.remove(os.path.join(SUB["running"], f"{tid}.json"))
+            free.extend(devs)
+            free.sort()
+            del procs[tid]
+            print(f"[devq] done {tid} {t['name']} rc={rc}", flush=True)
+        # start FIFO tasks that fit (a task that does not fit blocks smaller later ones only if it is first)
+        pend = sorted((f for f in os.listdir(SUB["pending"]) if f.endswith(".json") and not f.startswith(".")),
+                      key=lambda f: int(f[1:-5]))
+        for fn in pend:
+            t = json.load(open(os.path.join(SUB["pending"], fn)))
+            if t["gpus"] > a.gpus:
+                t.update(rc=-2, start=time.time(), end=time.time(), log="", error="needs more GPUs than allocated")
+                json.dump(t, open(os.path.join(SUB["done"], fn), "w"))
+                os.remove(os.path.join(SUB["pending"], fn))
+                continue
+            if t["gpus"] > len(free):
+                break
+            devs, free = free[:t["gpus"]], free[t["gpus"]:]
+            tid = t["id"]
+            log = os.path.join(SUB["done"], f"{tid}.log")
+            tmpdir = os.path.join(ROOT, "tmp", "job", f"{job}-{tid}")
+            os.makedirs(tmpdir, exist_ok=True)
+            script = (
+                "module load proxy/default >/dev/null 2>&1 || true\n"
+                f"export TMPDIR={tmpdir} CUDA_VISIBLE_DEVICES={','.join(map(str, devs))}\n"
+                f"export HF_HOME={ROOT}/cache/huggingface HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 "
+                "TRANSFORMERS_OFFLINE=1 WANDB_MODE=disabled\n"
+                f"cd {t['cwd']}\n"
+                + " ".join(t["cmd"]) + "\n"
+                f"rc=$?; rm -rf {tmpdir}; exit $rc\n")
+            t.update(start=time.time(), log=log, devices=devs, job=job)
+            json.dump(t, open(os.path.join(SUB["running"], fn), "w"))
+            os.remove(os.path.join(SUB["pending"], fn))
+            p = subprocess.Popen(["bash", "-lc", script], stdout=open(log, "w"), stderr=subprocess.STDOUT)
+            procs[tid] = (p, t, devs)
+            print(f"[devq] start {tid} {t['name']} gpus={devs}", flush=True)
+        if procs or pend:
+            idle_since = time.time()
+        elif time.time() - idle_since > a.idle_exit:
+            print(f"[devq] idle {a.idle_exit}s: releasing allocation {job}", flush=True)
+            subprocess.run(["scancel", job])
+            return
+        time.sleep(5)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    sp = ap.add_subparsers(dest="c", required=True)
+    s = sp.add_parser("submit")
+    s.add_argument("--gpus", type=int, required=True)
+    s.add_argument("--name", required=True)
+    s.add_argument("--cwd", default=os.getcwd())
+    s.add_argument("cmd", nargs=argparse.REMAINDER)
+    w = sp.add_parser("wait")
+    w.add_argument("ids", nargs="+")
+    sp.add_parser("ls")
+    r = sp.add_parser("runner")
+    r.add_argument("--gpus", type=int, required=True)
+    r.add_argument("--idle-exit", type=int, default=1200)
+    a = ap.parse_args()
+    if a.c == "submit":
+        if a.cmd and a.cmd[0] == "--":
+            a.cmd = a.cmd[1:]
+        if not a.cmd:
+            sys.exit("no command")
+    {"submit": submit, "wait": wait, "ls": ls, "runner": runner}[a.c](a)
+
+
+if __name__ == "__main__":
+    main()

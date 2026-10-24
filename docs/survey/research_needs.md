@@ -9,7 +9,7 @@ OV = `.../over-vocab.md`, VO = `.../vocab-overfitting.md`, CL = `.../closeout-20
 PLS = `project/marin-pls/docs/della/pls.md`, AUD = `.../pls_audit_2026-10-07.md`, SP = `tmp/pls_speed/plan.md`,
 NS = `project/nanoswe/docs/general_pretraining.md`, L = launcher `experiments/references/della_muonh_qwen3_scaling.py`.
 Git numbers come from `git diff --numstat <merge-base> <branch>` and `git log --numstat`; the raw logs are cached in
-`project/nanomarin/cache/gitlog/<branch>.numstat.txt`. sacct dumps are in `project/nanomarin/cache/sacct/`.
+`project/marin.cpp/cache/gitlog/<branch>.numstat.txt`. sacct dumps are in `project/marin.cpp/cache/sacct/`.
 
 ## 0. Key findings in five lines
 

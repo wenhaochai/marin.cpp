@@ -1,4 +1,4 @@
-# nanomarin
+# marin.cpp
 
 A speed-first rewrite of the marin/levanter pretraining stack, built only for the owner's own experiments: one node, at most 8 H100s, dense Qwen3-style models from 130m to 1.2B, and the 48-layer per-layer-readout models of the pls study.
 
