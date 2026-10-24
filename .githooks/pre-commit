@@ -1,0 +1,3 @@
+#!/bin/bash
+# Block commits that carry personal cluster identifiers or secrets (the repo is public). Fix: python3 tools/scrub.py
+exec python3 "$(git rev-parse --show-toplevel)/tools/scrub.py" --check --staged
