@@ -16,10 +16,12 @@ namespace nm {
 // ------------------------------------------------------------------------------------------------ converted files
 // Written once by tools/convert/levanter_to_flat.py (Python, vis node) from the levanter zarr3/tensorstore cache:
 //   <dir>/tokens.u32        all tokens of the cache in cache order, little-endian uint32 (10,000,000,738 x 4 B)
-//   <dir>/segs_per_seq.u8   segments of each S-token window (EOS-derived), for max_segs_per_seq and data queries
+//   <dir>/segs_per_seq.u16  exact segment count of each S-token window (EOS-derived; Paloma reaches 291), for
+//                           max_segs_per_seq and data queries (meta format 2; load_dataset_meta refuses format 1)
 //   <dir>/docs.u64          document start offsets (token index), plus <dir>/doc_bytes.u64 [n_docs, 2] source byte
 //                           ranges when the source has them (maps resegmented / repacked sequences across tokenizers)
-//   <dir>/meta.json         the fields below + sha256 of every file + the source path and its ledger
+//   <dir>/meta.json         the fields below + sha256 of every file + the source path and its ledger; written last,
+//                           after every file was checked as <file>.tmp and renamed
 // Eval sets (eval.hpp) use the same layout with the windows of the 16 domains concatenated in component order.
 struct DatasetMeta {
   std::string name, dir;
@@ -29,15 +31,20 @@ struct DatasetMeta {
   uint64_t n_docs = 0;
   int vocab = 0;                  // 128256
   int32_t bos = 128000, eos = 128001;
-  int max_segs_per_seq = 0;       // 17 boundaries-based for fineweb-edu-10B at 4096 (plus EOS-in-text, measured)
+  int max_segs_per_seq = 0;       // 17 for fineweb-edu-10B at 4096 (no BOS/EOS inside text: data.md §2.4); Paloma 291
   std::string tokens_sha256;
   std::string meta_sha256;        // sha256 of meta.json: the value hashed into the run identity
 };
 DatasetMeta load_dataset_meta(const std::string& dir);
 
 // mmap of tokens.u32 (MAP_SHARED | read-only; page cache shared by the ranks of the process) and of docs.u64.
+// The mappings live until the process exits: a run opens one TokenFile per dataset, and src/data keeps each file's fd
+// and identity, keyed by the mapping address, for the life of the process. So a TokenFile is never closed or copied.
 class TokenFile {
  public:
+  TokenFile() = default;
+  TokenFile(const TokenFile&) = delete;
+  TokenFile& operator=(const TokenFile&) = delete;
   void open(const DatasetMeta& m);
   const uint32_t* window(uint64_t seq, int S) const;  // tokens[seq*S, seq*S + S)
   uint64_t doc_of_token(uint64_t token_index) const;  // binary search in docs.u64
@@ -83,13 +90,17 @@ class LevanterOrder {
 // phases; phase p covers updates [step_begin, step_end) with its own dataset, global batch and sequence length (a
 // change of batch or length is a new step regime, model.hpp StepRegime), and maps (step, row) to a sequence:
 //   Levanter   j = index_base + (step - step_begin) * B + row;  seq = LevanterOrder(j)      (the baseline: one phase)
-//   Repeat     mixture index (j mod subset) of a Levanter order, for a real-valued number of passes (DATA_EPOCHS=2.4
-//              repeats without reshuffle, like levanter's max_train_batches restart); pass q optionally reshuffled with
-//              permutation(fold_in(Key(seed), q))
+//   Repeat     levanter's max_train_batches slice-then-restart (DATA_EPOCHS=2.4 repeats without reshuffle): the LCG-
+//              permuted set is sliced to its first `subset` sequences before the mixture, so the block-shuffled index
+//              wraps mod subset and sigma stays over the full N: seq = sigma_N((blk*B + pi_blk[j mod B]) mod subset);
+//              for a real-valued number of passes. Optionally pass q >= 1 is reshuffled: sigma_N(perm_q[m mod
+//              subset]), perm_q = permutation(fold_in(Key(seed), q), subset); a reshuffled phase needs index_base 0.
 //   Explicit   seq ids from a u32 file (pre-materialized pass caches, resegmented / repacked data from tools/convert)
 // Forks (run.parent = <id>@<k>) copy the parent's plan up to k and may append phases after k: batches before k are
 // bit-identical to the parent's. Gate: seq_of equals the order the JAX runs read (DATA_EPOCHS 2.4, PASS_DATA rs,
 // repack), bitwise.
+// The mixture block B of Levanter and Repeat phases is data.mix_block; load_data_plan accepts only levanter's 2048 until
+// a phase needs another (then Phase gets a mix_block field and the loader reads it).
 enum class OrderKind : uint8_t { Levanter = 0, Repeat = 1, Explicit = 2 };
 struct Phase {
   int64_t step_begin = 0, step_end = 0;
@@ -133,6 +144,17 @@ struct TokenSlot {
 };
 class BatchLoader {
  public:
+  BatchLoader() = default;
+  BatchLoader(const BatchLoader&) = delete;
+  BatchLoader& operator=(const BatchLoader&) = delete;
+  // A started loader stops itself (joins its threads, frees the slots) when destroyed; stop() is idempotent and
+  // returns at once on a loader that never started. An error inside stop() is dropped here: call stop() first to see it.
+  ~BatchLoader() {
+    try {
+      stop();
+    } catch (...) {
+    }
+  }
   void start(const DataPlan& plan, const std::vector<TokenFile*>& files, int nranks, int prefetch_steps,
              int reader_threads, int64_t first_step);
   TokenSlot& acquire(int64_t step);   // blocks until filled (counts throughput/loading_time when it waits)

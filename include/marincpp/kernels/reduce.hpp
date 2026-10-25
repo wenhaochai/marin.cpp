@@ -1,6 +1,7 @@
 // Deterministic reductions shared by the norm, embedding, CE, eval and statistics kernels. DESIGN.md §11.
 // Rule: no floating-point atomics anywhere in a training step. Every reduction is (1) per-CTA partials written to a
-// planned buffer, then (2) one fixed-order pass. The order depends only on the shape, never on the launch timing.
+// planned buffer, then (2) one fixed-order pass. The order depends only on the shape and the GPU's SM count (the norm
+// partition count, ew::norm_partial_rows), never on the launch timing: bitwise repeatable on one GPU type.
 #pragma once
 
 #include <cstdint>

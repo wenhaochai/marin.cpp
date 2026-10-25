@@ -264,6 +264,8 @@ If 47 more probe heads share the trunk (research need "several variants share on
 47 x 128,256 x 512 x 18 B = 55.5 GB replicated, 13.9 GB per rank sharded, plus 12.4 GB of replicated f32 gradients;
 the planner then also reduce-scatters vocab-sized gradients after every microbatch (ZeRO-2 for those tensors only,
 `optim.zero2_vocab=auto`), which removes the replicated gradient at the cost of one reduce-scatter per microbatch.
+ZeRO-2 is not built yet: `auto` resolves to off, `validate()` refuses `on`, and `build_plan` and `step_budget` have no
+ZeRO-2 terms. The stage that adds the per-microbatch reduce-scatter adds both terms.
 
 #### Other sizes (totals; full tables from `marincpp plan`)
 
@@ -365,10 +367,18 @@ the bf16 rounding of levanter's per-microbatch gradient costs no transient and n
 
 - Forward `k_embed_fwd`: bf16 gather `out[t] = E_bf16[token[t]]`, no scale (model.md §2).
 - Backward `embed_bwd_sorted`: CUB radix sort of (token, position) pairs over `ceil(log2 V)` key bits (17 at V =
-  128,256; 24 for 12.8M-row tables), run boundaries, one CTA per distinct token summing its rows in ascending position
-  order, added to the f32 gradient. `exec.embed_accum=f32` sums in f32 (default); `bf16_seq` keeps a bf16 running sum
-  in the same order (levanter's precision, deterministic). No atomics. The run list doubles as the touched-row mask for
-  lazy embedding updates (§4.5). Cost ~0.2 ms at 131,072 tokens.
+  128,256; 24 for 12.8M-row tables); the sort is stable, so the positions of each token ascend. Then:
+  - `exec.embed_accum=f32` (default), `k_embed_chunks` + `k_embed_merge`: the sorted list is cut into fixed chunks of
+    256 entries; one warp per (chunk, 256-column slice) sums each run piece of its chunk in ascending position order in
+    f32. A run inside one chunk is added to the f32 gradient at once; the pieces of a run that crosses chunks are
+    merged in chunk order by the chunk where the run starts. No warp walks a long run alone.
+  - `bf16_seq` (strict preset), `k_embed_seq`: a bf16 running sum in ascending position order (levanter's precision),
+    one warp per (run, 64-column slice), the warp of the chunk where the run starts; dout rows are loaded 32 entries
+    ahead of the adds.
+  No atomics; the order depends only on the token sequence. The kernels set `touched_rows[token]`, the touched-row mask
+  for lazy embedding updates (§4.5); no run list is built. Cost at 131,072 tokens, D = 512, sort included (A100, S3):
+  0.51 ms (f32), 0.62-1.0 ms (`bf16_seq`, uniform to Zipf tokens; a single token repeated 131,072 times takes 28 ms,
+  the critical path of one sequential sum). H100 times come from the devq profile.
 - The embedding is the default `InputLayer` (§9.3); composed rows, n-gram tables and byte inputs are other input layers.
 
 ### 3.3 RMSNorm, QK-norm, residual
@@ -429,7 +439,11 @@ be zeroed every call. Version 2 never runs that grid in training. Two fixed sche
   trainer and do not decide D1 alone.
 
 Scale: under `levanter`, the QKV epilogue multiplies q by the bf16 scale in bf16 and FA3 gets `softmax_scale = 1`; the
-dq postprocess multiplies dq by the scale in bf16 (numerics.md §3.4). Under `accurate`, FA3 gets the bf16 scale.
+dq postprocess multiplies dq by the scale in bf16 (numerics.md §3.4). Under `accurate`, FA3 gets the bf16 scale, so
+the caller passes `q_scale = 1` to `qknorm_rope_fwd` and the whole scale to `dq_post_qknorm_rope_bwd`. The scale value
+is the constant levanter makes from the Python float `1/sqrt(hd)` in the compute dtype (class M): `bf16(1/sqrt(hd))`
+under the bf16 policy (both roundings), `f32(1/sqrt(hd))` under the f32 policy. The kernels apply the `q_scale` they
+are passed as one multiply (bf16 under levanter + bf16 storage, where it must be a bf16 value; f32 otherwise).
 
 GQA (520m, 1.2B): head h reads kv head h / G; `Wq` rows are ordered (kv, g, d) as levanter's `q_proj`; FA3 uses
 PackGQA in the forward.
@@ -593,12 +607,19 @@ is gone. Owners are assigned by LPT on NS cost plus elementwise bytes.
 
 ### 4.4 Schedules
 
-The schedule tables of record are a fixture: `tools/levref/schedules.py` runs the jitted optax schedules of the levanter
-config on a GPU (XLA:GPU's f32 cos and pow, the same code on sm_80 and sm_90; T0.7 checks the H100 logged values) and
-dumps `sched_main(k)`, `sched_adam(k)` for k = 0..N-1 and `1 - b^t` for t = 1..N, for each config in use. marincpp loads
-it (`optim.schedule_fixture`, hashed by content). The C++ formula of optim.md §6 (`build_schedules`, host, exact f32
-operation order, `-ffp-contract=off`) runs beside it as a cross-check that counts ulp differences; it never overrides a
-fixture value. A run without a fixture uses the formula and records `schedule_source: formula`; parity runs
+The schedule tables of record are a fixture: `tests/s2/schedule_fixture.py` runs the jitted optax schedules of the
+levanter config on a GPU (XLA:GPU's f32 arithmetic; the eta tables equal every H100 logged value, so they are the same
+on sm_80 and sm_90; T0.7 checks them) and dumps `sched_main(k)`, `sched_adam(k)` for k = 0..N-1 and `1 - b^t` for
+t = 1..N, for each config in use. marincpp loads it (`optim.schedule_fixture`, hashed by content). The C++ formula
+(`build_schedules` in `src/sched`, host, `-ffp-contract=off`) runs beside it as a cross-check that counts ulp
+differences; it never overrides a fixture value. The formula is optim.md §6 in XLA:GPU's f32 operation order, not the
+literal one: `x / C` is `x * f32(1/C)`, the cosine argument is `c * f32(f32(pi) * f32(1/T_d))` (one folded constant),
+and cos and pow are ports of libdevice `__nv_cosf` and `__nv_powf` (S2 read them from the optimized HLO and the LLVM
+IR). The port emulates powf's `rcp.approx.ftz.f32` as the correctly rounded reciprocal, which differs from the
+hardware by 1 ulp of `b^t` at small t for rare betas (measured on sm_80; `src/sched/sched.hpp`); the fixture is the
+record. A config the formula refuses (`optim.warmup = 1`, `optim.num_steps >= 2^24`, a beta whose f32 is 1) keeps the
+fixture with `n_ulp_diffs = -1` (cross-check unavailable). A run without a fixture uses the formula and records
+`schedule_source: formula`; parity runs
 (`run.parity=true`: T2-T6; they also require the T1.0 facts file and a verified init) refuse to
 start without one. T0.7 requires the fixture to equal every logged k bitwise, including 130m k = 4958 and 1.2B
 k = 22887.
@@ -609,7 +630,7 @@ k = 22887.
 norm scope. It applies to Adam and AdamH. The mask is applied in `sumsq_partials` (frozen rows enter neither the clip
 norm nor the AdamH norms) and in the moment updates (frozen rows get no update), as `freeze_rows_muonh.py` does: in
 block mode the kept rows are [0, lo) plus the last 256 specials with their own norm, the rare rows another block with
-their own norm and lr scale. Lazy embedding updates take the touched-row mask from the run list of `embed_bwd_sorted`.
+their own norm and lr scale. Lazy embedding updates take the touched-row mask (`touched_rows`) from `embed_bwd_sorted`.
 Gate: one T1.7-style update against the JAX optimizer, rel <= 1e-6.
 
 ## 5. Data
@@ -619,7 +640,11 @@ Gate: one T1.7-style update against the JAX optimizer, rel <= 1e-6.
 `tools/convert/levanter_to_flat.py`, built on `bench/n1_loader/nmloader.py` (verified: 103 of 103 checks):
 
 - `$NM_DATA/fineweb-edu-10B-marin128k/tokens.u32`: the 10,000,000,738 tokens in cache order (40.0 GB).
-- `segs_per_seq.u8` and `max_segs_per_seq` in meta.json.
+- `segs_per_seq.u16` (exact segment count of every window; a 4096-token window can hold up to 4096 segments, and
+  Paloma has windows with up to 291) and `max_segs_per_seq` in meta.json (meta format 2; `load_dataset_meta` refuses
+  format 1).
+- Every file is written as `<file>.tmp`, checked, then renamed; `meta.json` is written last, so a failed check or a
+  crash leaves the old set or no `meta.json`.
 - `docs.u64`: document start offsets, and per document its byte range in the source text when the source has it
   (needed to map resegmented and repacked sequences across tokenizers, §5.5).
 - `meta.json`: counts, BOS/EOS, vocab, sha256 of every file, source path and its shard ledger.
@@ -630,7 +655,8 @@ Gate: one T1.7-style update against the JAX optimizer, rel <= 1e-6.
 ### 5.2 C++ reader
 
 `TokenFile` maps `tokens.u32` read-only (`MAP_SHARED`). A window is 16 KiB; a 128-row step reads 2 MiB at random
-offsets; 130m needs about 11 MB/s on average.
+offsets; 130m needs about 11 MB/s on average. A `TokenFile` mapping lives until the process exits (a run opens one per
+dataset), so `TokenFile` is not copyable and has no close. A `BatchLoader` destroyed while started stops itself.
 
 ### 5.3 Exact levanter order
 
@@ -656,9 +682,13 @@ of phases `[step_begin, step_end)`, each with its own dataset, global batch and 
 length is a new regime, §2.4):
 
 - `Levanter`: the baseline closed form with an `index_base`.
-- `Repeat`: mixture index `j mod subset` of a Levanter order for a real-valued number of passes (`DATA_EPOCHS=2.4`
-  repeats without reshuffle, as levanter's `max_train_batches` restart), optionally reshuffled per pass with
-  `permutation(fold_in(Key(seed), pass))`.
+- `Repeat`: levanter's `max_train_batches` slice-then-restart, for a real-valued number of passes (`DATA_EPOCHS=2.4`
+  repeats without reshuffle). Levanter slices the LCG-permuted set to its first `subset` sequences before the mixture
+  (`della_muonh_qwen3_scaling.py:768-770`; levanter `datasets.py:858-866`, `mixture.py` `_remap_indices`), so the
+  restart wraps the block-shuffled index mod `subset` while the LCG sigma stays over the full N:
+  `seq = sigma_N((blk*B + pi_blk[j mod B]) mod subset)`. It is not "mixture index `j mod subset` of a Levanter order".
+  Optionally pass q >= 1 is reshuffled: `sigma_N(perm_q[m mod subset])`, `perm_q = permutation(fold_in(Key(seed), q),
+  subset)`; a reshuffled phase needs `index_base = 0`.
 - `Explicit`: sequence ids from a file (resegmented or repacked passes).
 
 A fork sets `run.parent = <run_id>@<k>`, loads the parent's checkpoint at k, checks the parent's hash against the
@@ -945,7 +975,8 @@ loss and grads with per-readout losses, optimizer step, eval), and the variant e
 
 ## 11. Determinism
 
-`exec.deterministic=true` (default) makes a step bitwise repeatable for a fixed GPU count and microbatch split:
+`exec.deterministic=true` (default) makes a step bitwise repeatable for a fixed GPU type, GPU count and microbatch split
+(the norm partial count depends on the SM count, so A100 and H100 reduce in different partials):
 
 | source | fix |
 |---|---|
@@ -1037,7 +1068,8 @@ Notes:
 | cuDNN (CudnnSdpa only) | no module; wheel `nvidia-cudnn-cu12==9.19.0.56` to `$ROOT/nm_deps/cudnn`; cudnn-frontend 1.32 submodule | `-DNM_WITH_CUDNN=ON` |
 | CUTLASS / CuTe | `7127592` (v4.2.1, FA3's pin), submodule | include path |
 | FlashAttention-3 | `hopper/` at `767386d`, vendored subset with the backward scheduler and doc-causal patches as separate commits | compiled into `libmarincpp_kernels.so` |
-| toml++ 3.4, nlohmann/json 3.11, xxHash 0.8 | single headers in `third_party/` | include path |
+| TOML and JSON | not vendored: `src/config` has its own TOML 1.0 subset reader and writer, `src/data` its own JSON reader (no toml++, no nlohmann/json) | — |
+| xxHash 0.8 (checkpoint slice checksums, S10) | single header in `third_party/`, added with S10 | include path |
 
 FA3 compile check (della-vis1, nice -n 19, `hopper/setup.py` flags): the hd64 and hd128 bf16 sm90 forward and backward
 units compile with CUDA 12.8 and 13.0 against CUTLASS `7127592` without torch. `--use_fast_math` stays confined to the
@@ -1047,30 +1079,34 @@ nodes (12.4+) are available in 12.8.
 ### 13.2 Layout and size
 
 ```
-CMakeLists.txt            targets: marincpp (sm_90a), marincpp_kernels (shared lib + C ABI, sm_90a [+ sm_80/86 portable]),
-                          nm_tests (sm_90a + sm_80/86)
+CMakeLists.txt            targets: marincpp-train (the binary; `marincpp <command>` in this document means it), libmarincpp.a,
+                          libmarincpp_kernels.so (C ABI), one OBJECT library per module (sm_90a + sm_80 portable, sm_90a-only units)
+cmake/                    nm_module(), flags (-Wall -Werror, -ffp-contract=off, --fmad=false units), capi.map
 include/marincpp/        the headers of this design (interfaces)
-src/core/                 config, knob registry, registries, run id, run dir, signals, process/threads   ~2,000 LoC
+src/core/ + src/config/   errors, SHA-256, registries, device probes; knob table, TOML, resolve, run id  ~2,000 LoC
 src/memory/               planner, arena, bind-by-name, canary/poison, plan printing                    ~1,100
-src/kernels/              doc_meta, embedding, norms, qknorm_rope, swiglu, casts, reductions, f32 forms ~3,000
+src/kernels/elementwise/  doc_meta, embedding, norms, qknorm_rope, swiglu, casts, reductions, f32 forms ~3,000
 src/kernels/gemm/         GemmCache search, cuBLASLt, CUTLASS kernels and fused epilogues               ~3,000
 src/kernels/attention/    FA3 entry points + bwd scheduler + doc-causal patch (~2,000), cuDNN (~700), LevRef + RefF32 (~1,100)  ~3,800
-src/kernels/ce/           impl A (~400), B1 (~1,500), B1.5 (~800), B2 (~1,600), readouts (~300)         ~4,600
+src/kernels/cross_entropy/  impl A (~400), B1 (~1,500), B1.5 (~800), B2 (~1,600), readouts (~300)       ~4,600
 src/kernels/optim/        multi-tensor framework, clip, MuonH, NS (TF32/f32/3xTF32), hyperball, AdamH, Adam, row partitions  ~1,900
 src/model/                Model, baseline block, interfaces, readout table, regimes, RNG, graph capture  ~3,000
 src/model/blocks|inputs|heads|losses/   variants (preln, lns, deepnorm, keel, hc, mhc, attnres(+block); sampled, composed)  ~5,000
-src/optim/                plan, groups, owners, schedules (fixture + formula), NS batching               ~1,100
+src/optim/                plan, groups, owners, NS batching                                              ~1,100
+src/sched/                schedules: fixture loader, XLA:GPU-order formula, ulp cross-check (§4.4)       ~530
 src/comm/                 GradReducer (reduce-to-owner), all-gather, metrics reduction, ShardedTable     ~1,200
 src/data/                 meta, token file, threefry, levanter order, data plans, prefetch ring          ~1,300
 src/eval/                 eval sources, groupings, accumulators, keys                                     ~1,100
-src/ckpt/                 manifest, writer, reader, retention, init.from mapping                          ~1,200
+src/metrics/              StepRecord, JSONL, logging contract
+src/checkpoint/           manifest, writer, reader, retention, init.from mapping                          ~1,200
 src/train/ + main.cpp     trainer, CLI, profile mode                                                      ~1,300
-src/capi/                 C ABI                                                                           ~1,200
-tests/                    pytest: references, gradient checks, levref comparisons, gates V1-V4           ~6,500 Python
+                          (the C ABI lives in each module as capi_<module>.cpp)
+tests/<stage>/            C++ suites (nmtest runner) and plain Python scripts run by ctest: references,
+                          gradient checks, levref comparisons, gates V1-V4                                ~6,500 Python
 tools/convert/            levanter -> flat converter                                                      ~600
-tools/levref/             fixtures, schedules, precision probe, variant mode, levanter importer            ~1,500
+tools/levref/             fixtures, precision probe, variant mode, levanter importer                      ~1,500
 tools/wandb_mirror.py     W&B sidecar                                                                     ~300
-third_party/              cutlass, fa3-hopper subset (+patches), cudnn-frontend, toml++, json, xxhash
+third_party/              cutlass, fa3-hopper subset (+patches), cudnn-frontend, xxhash
 ```
 
 Total own code: about 37,000 lines of C++/CUDA (24,000 for stage 1 without the variant family, B2 and the sharded table)
@@ -1082,7 +1118,7 @@ and 8,900 of Python.
 |---|---|---|
 | S0 | CMake (sm_90a + sm_80/86 tests), core, knob registry with registry-checked names, hash of non-default knobs + table version, config resolution, memory planner with bind-by-name, `marincpp plan`, `marincpp knobs` | planner reproduces the §2.5 tables to the byte; parameter count and flops_per_example of the 4 sizes (T0.8); optimizer constants' bit patterns (T0.6) |
 | S1 | converter (Python) + TokenFile, threefry, LevanterOrder, DataPlan, prefetch ring and pinned slots | T0.1, T0.2, T0.3, T0.4, T0.5 |
-| S2 | schedule fixture (tools/levref) + loader + formula cross-check | T0.7 (all four sizes, every k) |
+| S2 | schedule fixture (`tests/s2/schedule_fixture.py`) + loader + formula cross-check (`src/sched`) | T0.7 (all four sizes, every k) |
 | S3 | unfused elementwise kernels, bf16 and f32 forms, + C ABI + references; FMA policy | per-kernel gradient checks (per-row report); T1.2 (RMSNorm), T1.3 (RoPE tables bitwise) |
 | S4 | GemmCache timed search with deterministic split-K/stream-K and the levanter wgrad epilogue; FA3 entry points with both fixed backward schedulers, glue as arena buffers; LevRef, RefF32; cuDNN | GEMM checks; T1.4 (all backends, 130m/520m/1.2B shapes); E1b decision (O1) |
 | S5 | CE A (bf16 and f32), B1 (bf16 and f32 store), B1.5, B2; readouts with `dx = nullptr` | T1.5 at D = 512/768/1024/2048; E2 decision per D (O2) |

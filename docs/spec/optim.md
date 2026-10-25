@@ -328,7 +328,10 @@ integer exponent, which takes case 3, `lax.pow(x1, x2)` (`jax/_src/numpy/ufuncs.
 repeated multiplication, is used only for a concrete exponent, `:2682-2690`). The lowering converts the int32 exponent
 to f32 and emits `stablehlo.power(f32, f32)` (`jax/_src/lax/lax.py:4904-4911`). So the denominator is
 `1 - pow_f32(f32(b), f32(t))`, evaluated in f32 by XLA:GPU's f32 pow. It is not repeated multiplication and not a float64
-pow. Which device routine XLA:GPU uses for f32 pow (and so its ulp error) is open (§10). AdamH cancels this factor
+pow. XLA:GPU computes it with libdevice `__nv_powf`, inlined into the fusion (read from the LLVM IR of the schedule
+fixture generator, `docs/BUILD_LOG.md` S2), whose reciprocal step is the hardware approximation `rcp.approx.ftz.f32`. A
+port with a correctly rounded reciprocal differs from it by 1 ulp of `b^t` at small t for rare betas (none of 16 common
+betas at t = 1..2000, measured on sm_80). The schedule fixture (DESIGN.md §4.4) holds the `1 - b^t` tables of record. AdamH cancels this factor
 through the projection, except through `eps`. Plain Adam (embedding, norms) does not.
 
 ## 6. Learning-rate schedules
@@ -351,9 +354,10 @@ k <  992:  η(k) = peak
 k >= 992:  c = clip(k - 992, 0, 3967);  frac = 1 - c/3967;  η(k) = (peak - 0) * frac + 0   # OX/schedules/_schedule.py:142-145
 ```
 
-`c/3967` is an f32 division of the int32 count (converted exactly) by 3967, and `1 - .` is exact in f32. The last
-update, k = 4958, uses `f32(0.02) · (1 − f32(3966/3967))` = **5.041361e-06** (main) and `f32(0.008) · (1 − f32(3966/3967))`
-= **2.016544e-06** (adam), both as logged. These are not the real numbers peak/3967 = 5.04159e-6 and 2.01664e-6: the f32
+XLA:GPU does not divide here: its algebraic simplifier rewrites `c/3967` as `c * f32(1/3967)` (the constant
+0.000252079655 in the optimized HLO), one rounded multiply of the int32 count (converted exactly); `1 - .` is exact in
+f32. An f32 division gives other bits at 261 of the 4959 k. The last update, k = 4958, uses `f32(0.02) · (1 − f32(3966/3967))` = **5.041361e-06** (main) and `f32(0.008) · (1 − f32(3966/3967))`
+= **2.016544e-06** (adam), both as logged (here the multiply by `f32(1/3967)` gives the same bits as the division). These are not the real numbers peak/3967 = 5.04159e-6 and 2.01664e-6: the f32
 rounding of `3966/3967` before the subtraction makes them 4.5e-5 (relative) lower. Computing `peak*(T_d - c)/T_d` or
 `peak/3967` gives different bits at every late step. The rate never reaches 0 during training.
 
@@ -370,8 +374,12 @@ k >= 1000: c = minimum(int32(k - 1000), float(T_d))     # promotes to f32; exact
            η(k) = peak * ((1 - 0) * (0.5 * (1 + cos((f32(pi) * c) / T_d)))**1.0 + 0)   # OX/schedules/_schedule.py:378-388
 ```
 
-`(f32(pi) * c) / T_d` is left-associative, two rounded f32 operations (`_schedule.py:386`), and `cos` is XLA:GPU's f32
-cos. `**1.0` is `stablehlo.power(x, 1.0)`; XLA's algebraic simplifier should fold it to `x` (unverified).
+The source writes `(f32(pi) * c) / T_d` (`_schedule.py:386`), but XLA:GPU's algebraic simplifier folds it into
+`c * f32(f32(pi) * f32(1/T_d))`: one constant (300m: 0.0003008036 = `f32(pi) * f32(1/10444)`) and one rounded multiply
+at run time, not two rounded operations. `cos` is libdevice `__nv_cosf`, inlined into the fusion. `**1.0` is folded to
+`x` (verified in the optimized HLO). The warmup's `c/1000` is likewise `c * f32(1/1000)`. Evaluating the formulas above
+literally in f32 (IEEE division, correctly rounded cos) differs from the logged values at 261 (130m), 3028 (300m), 3118 (520m) and 5569
+(1_2b) logged steps, the first at k = 58, inside the warmup.
 
 The warmup is computed in the form `(init − end)·frac + end`, not `peak·k/1000`. This matters for bits: 300m logs
 2.0000152e-05 at k = 2, which is this form's f32 rounding. At k = 1000, η = peak.
@@ -390,7 +398,9 @@ At 1_2b the true value is below half an f32 ulp at −1, so `1 + cos` rounds to 
 reproduces every row (`run-20260914_123815-...-300m`, `run-20260915_170105-...-520m`,
 `run-20260917_142202-...-1_2b` in `cache/wandb/`).
 
-**Lookup table.** A bit-exact port should not trust its own cos, pow and division here. W&B logs the exact f32
+**Lookup table.** The schedule fixture (DESIGN.md §4.4: the jitted optax schedules evaluated on a GPU at every k) is
+the table of record; it replaces the logged table and the hole formulas below, and T0.7 checks it against every logged
+value. A port should not trust its own cos, pow and division here. W&B logs the exact f32
 `optim/learning_rate` and `optim/adam_lr` at `_step` k ≥ 2 (§3 step 3). Load them as a per-k table from the cached
 histories `$ROOT/project/marin.cpp/cache/wandb/run-2026091[4-7]_*-muonh-qwen3-<size>-della4xh100.jsonl.gz`
 (one file per resumed segment; a step re-run after a resume appears once). The table has holes: of k = 2..N−1, 130m
@@ -484,10 +494,10 @@ def step(P, G, S, k):                         # P params, G mean grads, S state,
    (`jax/_src/numpy/linalg.py:1276-1277`), the ND projection uses `sqrt(sum(square(.)))` (`util.py:318-321`), and the
    clip norm is `sqrt(sum(jnp.sum(abs_sq(x))))` (`OX/_src/linear_algebra.py:35-39`). They are plain f32 reductions;
    only their reduction order is open (item 4). The model's forward and backward matmuls run in bf16 compute.
-7. **XLA:GPU f32 transcendentals.** The f32 `pow` in the bias correction (§5.3) and the f32 `cos` in the cosine
-   schedule (§6.2) come from XLA:GPU's device routines, whose ulp errors a port will not match by default. For the
-   schedule, use the logged lookup table (§6.2). For `pow`, compare a port's `1 - b**t` for t = 1..N against a jitted
-   JAX run on a GPU node.
+7. **XLA:GPU f32 transcendentals** (resolved by S2). The f32 `pow` in the bias correction (§5.3) and the f32 `cos` in
+   the cosine schedule (§6.2) are libdevice `__nv_powf` and `__nv_cosf`, inlined into the fusion, and divisions by
+   constants become multiplies by f32 reciprocals. The schedule fixture is the record for the schedules and for
+   `1 - b**t`; marincpp's formula ports XLA's arithmetic and cross-checks the fixture (DESIGN.md §4.4).
 2. **"Global norm" clipping is per group** (§3.1). The code is unambiguous. The reading "one norm over all parameters"
    is wrong for this baseline.
 3. **The `"Embedding"` path test never matches** (§2.1). The routing result is the same either way: the embedding goes
@@ -530,3 +540,7 @@ Two skeptic reviews, 2026-10-24. Each issue was checked against the code and the
 No issue was rejected.
 
 Merge cross-check (2026-10-24): values stated in two or more sections were compared; the corrections are listed in `kaiyue_baseline.md` §C.
+
+Build corrections (S2, 2026-10-24): §5.3 rule 2, §6.1, §6.2 and §10 item 7 now state the arithmetic XLA:GPU runs, read
+from the optimized HLO and the LLVM IR of the schedule fixture generator (`docs/BUILD_LOG.md` S2). Applied to
+`kaiyue_baseline.md` Part 2 as well.

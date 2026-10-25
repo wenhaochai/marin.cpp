@@ -732,3 +732,60 @@ Known gaps
   thread (two rows per row group), not a larger CTA.
 - In a full ctest run on the shared GPU, s3_embed can exhaust its 4 out-of-memory retries while other tenants hold
   the memory (reviewer's run); run alone it passes.
+
+## Docs: requests of S0-S3 applied (2026-10-24)
+
+Built (DESIGN.md, docs/spec, include/marincpp only; no source file changed)
+- S0: DESIGN §2.5 states that ZeRO-2 for vocab-sized gradients is not built (`auto` = off, `on` refused, no planner or
+  budget terms). §13.2 names the binary `marincpp-train` (`marincpp <command>` in DESIGN means it) and lists the real
+  module directories. reduce.hpp and DESIGN §11: the reduction order depends on the shape and the SM count, so a step
+  is bitwise repeatable on one GPU type. readout.kind (§9.1) and §9.2 already carried the S0 text.
+- S1 (items 1-5): `segs_per_seq.u16`, meta format 2 and the `.tmp`-then-rename commit (data.hpp, DESIGN §5.1). Repeat =
+  levanter's slice-then-restart, `sigma_N((blk*B + pi_blk[j mod B]) mod subset)`, reshuffle needs index_base 0 (data.hpp,
+  DESIGN §5.5). data.md §2.4, §3.1 item 1, §9 item 2 (and kaiyue_baseline.md Part 3): BOS and EOS never occur inside
+  text (whole-corpus count); the old "once per window" came from documents cut by the window edges. DESIGN §13.1: no
+  vendored TOML or JSON library (own readers in src/config and src/data); xxHash comes with S10.
+  data.hpp: `BatchLoader` gets an inline destructor that calls `stop()` (idempotent, returns at once when never
+  started), so destroying a started loader no longer calls std::terminate; `BatchLoader` and `TokenFile` are not
+  copyable. Decision instead of the suggested `~TokenFile()` / `int fd_`: a TokenFile mapping lives until the process
+  exits (one per dataset per run; src/data's fd table and `shared_token_file` rely on mappings never moving), stated in
+  data.hpp and DESIGN §5.2. Phase gets no `mix_block` field yet; data.hpp states that plans accept only 2048 until a
+  phase needs another value. The pimpl is left to src/data's owner (the address-keyed table works).
+- S2 (items 1-6): optim.md §5.3 rule 2 (`__nv_powf`, rcp.approx gap, fixture is the record), §6.1 (`c * f32(1/3967)`;
+  k = 4958 gives the same bits either way, checked in numpy f32), §6.2 (folded constant `c * f32(f32(pi) * f32(1/T_d))`,
+  `__nv_cosf`, `**1.0` folded, warmup `c * f32(1/1000)`, literal-formula mismatch counts), "Lookup table" (the fixture
+  replaces the logged table and the hole formulas), §10 item 7 resolved; the same text in kaiyue_baseline.md Part 2.
+  T0.7 row: "equal to optim.md §6 as XLA:GPU computes it (marincpp build_schedules) and inside their logged neighbours".
+  DESIGN §4.4 (XLA:GPU order, `n_ulp_diffs = -1`, generator tests/s2/schedule_fixture.py), §13.2 (src/sched), §13.3 S2
+  row. optim.hpp `build_schedules` comment and `n_ulp_diffs = -1`; capi.h `config_toml` is a file path, `*n_ulp_diffs`
+  can be -1; knobs.def help text of optim.schedule_fixture names the generator (help text only; defaults unchanged).
+- S3 (items 1-3): elementwise.hpp embedding backward = `k_embed_chunks` + `k_embed_merge` (F32) and `k_embed_seq`
+  (Bf16Sequential), `touched_rows` as the lazy mask, the measured A100 times, `run_start` / `n_runs` marked unused (null).
+  DESIGN §3.2 and §4.5 likewise (0.51 ms F32, 0.62-1.0 ms Bf16Sequential at 131,072 tokens, not ~0.2 ms).
+  `QkNormRopeFwd` q_scale comment: one multiply by the value passed; under accurate FA3 takes the scale (q_scale = 1
+  here, the whole scale in dq_post). DESIGN §3.4 states the value: `bf16(1/sqrt(hd))` under the bf16 policy (both
+  roundings), `f32(1/sqrt(hd))` under the f32 policy (levanter's Python-float constant in the compute dtype).
+- T1.2 (controller decision): the T1.2 row of kaiyue_baseline.md passes an element of RMSNorm `dx` beyond 1 bf16 ulp
+  when `|nano - lev| <= 4 x 2^-24 x (|a r| + |c 2x|)`, addends in f64 from the bf16 inputs with `a = bf16(g dy)`.
+  Reason in the row: catastrophic cancellation in the k_norm dx sum, so any summation order of the row sum other than
+  XLA's moves dx by a few f32 ulps of the addends; 4 of 524,288 k_norm dx elements of the 130m fixture. New §C12 row
+  records it. targets.md and numerics.md do not restate T1.2 (checked). tests/s3 may switch the T1.2 XFAIL to PASS
+  under the amended rule.
+
+Tests (della-vis1, gcc-toolset 14, CUDA 12.8, fresh configure + build in a directory outside the repo)
+
+| check | result |
+|---|---|
+| build (every target, incl. nm_s0_headers: each public header compiles on its own; capi.h as C11) | 0 warnings, 0 errors |
+| ctest -E s3_bench | 31/31 pass (s1_loader exercises the new BatchLoader destructor; s3_t1_levref unchanged) |
+| `python3 tools/scrub.py docs/DESIGN.md docs/spec include` | clean |
+
+H100 gates: none (no kernel or source change).
+
+Open for other owners
+- src/data (S1's owner): optional pimpl in place of the address-keyed loader table; a `mix_block` Phase field when a
+  plan needs a block other than 2048 (header change on request).
+- src/kernels/elementwise (S3's owner): stop setting `EmbedBwdWorkspace::run_start` / `n_runs`, then ask for their
+  removal from elementwise.hpp. tests/s3: T1.2 XFAIL -> PASS under the amended rule.
+- tools/levref: S3 item 4 (a units fixture with non-unit gains; the GPU-made units fixture).
+- src/main.cpp (trainer stage): pass the dataset meta to `choose_plan`, `resolve` and `exec_shape` (S1 gap).

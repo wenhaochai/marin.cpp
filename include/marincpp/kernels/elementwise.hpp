@@ -32,7 +32,7 @@ struct DocMetaArgs {
   const uint8_t* row_valid;   // [rows] or nullptr (training: all valid)
   int rows, S;
   int32_t eos_id;             // 128001
-  int max_segs_per_seq;       // from DatasetMeta (17 measured for fineweb-edu-10B at S=4096; plan uses 24)
+  int max_segs_per_seq;       // from DatasetMeta (17 for fineweb-edu-10B at S=4096; 291 for Paloma)
   int32_t* targets;           // [T]
   float* weight;              // [T]
   int32_t* pos;               // [T]
@@ -47,21 +47,26 @@ void doc_meta(const DocMetaArgs& a, cudaStream_t s);
 // k_embed_fwd: out[t, :] = table_bf16[tokens[t], :]  (bf16 gather, x1.0; model.md §2)
 void embed_fwd(const bf16_t* table, const int32_t* tokens, bf16_t* out, int64_t T, int D, cudaStream_t s);
 
-// Deterministic backward (numerics.md §9.1 item 1 replaced by a sorted segment sum):
+// Deterministic backward (numerics.md §9.1 item 1 replaced by a sorted segment sum; DESIGN.md §3.2):
 //   1. cub::DeviceRadixSort::SortPairs over (token id, position) pairs, ceil(log2 V) key bits (17 at V = 128,256;
-//      24 for 12.8M-row tables);
-//   2. k_embed_bwd_runs: run-length boundaries of the sorted ids (also the touched-row list for lazy updates);
-//   3. k_embed_bwd_segsum: one CTA per run sums the rows of that token in ascending position order and adds the sum to
-//      dtable[token] (f32, accumulated across microbatches in microbatch order). EmbedAccum::F32 sums in f32;
-//      EmbedAccum::Bf16Sequential keeps a bf16 running sum in the same order (levanter's precision; strict preset).
+//      24 for 12.8M-row tables); stable, so each token's positions ascend.
+//   2. EmbedAccum::F32 (k_embed_chunks + k_embed_merge): fixed chunks of 256 sorted entries; one warp per (chunk,
+//      256-column slice) sums each run piece of its chunk in ascending position order in f32. A run inside one chunk
+//      is added to dtable[token] at once; the pieces of a run that crosses chunks go to per-chunk head / tail partials
+//      (2 x ceil(T/256) x D f32, in cub_temp) and are merged in chunk order by the chunk where the run starts.
+//      EmbedAccum::Bf16Sequential (k_embed_seq; strict preset): a bf16 running sum in ascending position order
+//      (levanter's precision), one warp per (run, 64-column slice), then added to dtable[token] in f32.
+//   dtable accumulates across microbatches in microbatch order; touched_rows[token] = 1 for every token present (the
+//   mask for lazy updates). Measured at T = 131,072, D = 512, sort included, A100: 0.51 ms (F32), 0.62-1.0 ms
+//   (Bf16Sequential, uniform to Zipf tokens; one token repeated T times: 28 ms, the sequential critical path).
 // No atomics; bitwise repeatable. Rows of tokens absent from the batch are untouched (Adam still moves them unless the
 // row partition is lazy).
 struct EmbedBwdWorkspace {
-  void* cub_temp; size_t cub_bytes;
+  void* cub_temp; size_t cub_bytes;       // CUB temp storage, then the F32 chunk partials (D <= 4096 in the sizing)
   uint32_t* keys_in; uint32_t* keys_out;  // [T]
   int32_t* vals_in; int32_t* vals_out;    // [T]
-  int32_t* run_start;                      // [T + 1]
-  int32_t* n_runs;                         // device scalar
+  int32_t* run_start;                      // unused, null (no run list is built); to be removed with its callers
+  int32_t* n_runs;                         // unused, null
 };
 uint64_t embed_bwd_workspace_bytes(int64_t T, int V);
 void embed_bwd_sorted(const bf16_t* dout, const int32_t* tokens, float* dtable, int64_t T, int D, int V,
@@ -119,8 +124,12 @@ void sandwich_tail_bwd(const SandwichTailBwd& a, Rounding r, cudaStream_t s);   
 // ------------------------------------------------------------------------------------------------ QK-norm + RoPE
 // Per (token, head): RMSNorm over hd with the layer's shared q_norm / k_norm gain, then RoPE (NeoX half split,
 // rotate_half(x) = [-x2, x1]) with bf16 cos/sin tables at absolute position pos[t], then q *= q_scale.
-// Levanter: every multiply/add rounds to bf16 (numerics.md §3.3-§3.4); q_scale = bf16(1/sqrt(hd)) applied in bf16.
-// Accurate: f32 chain, one rounding; q_scale is still the bf16 constant (class M), folded into the rounding.
+// q_scale is applied as one multiply by the value passed; the caller chooses it (DESIGN.md §3.4).
+// Levanter: every multiply/add rounds to bf16 (numerics.md §3.3-§3.4); q_scale = bf16(1/sqrt(hd)), multiplied in bf16
+// (with bf16 storage it must be a bf16 value: checked).
+// Accurate: f32 chain, one rounding; q_scale is one f32 multiply inside the chain. FA3 takes the scale under accurate,
+// so the caller passes q_scale = 1 here and the whole scale to dq_post_qknorm_rope_bwd.
+// f32 policy: the scale is f32(1/sqrt(hd)) (levanter's Python-float constant in the f32 compute dtype).
 // The raw q, k (pre-norm) stay in the qkv buffer for the backward; outputs go to q_rot, k_rot ([T, H*hd], [T, KV*hd]).
 struct QkNormRopeFwd {
   const bf16_t* qkv; int64_t qkv_ld;      // [T, (H+2KV)*hd]: q | k | v column blocks, GQA head order h = kv*G + g

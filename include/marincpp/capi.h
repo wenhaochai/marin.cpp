@@ -112,7 +112,9 @@ int nm_adam_update(float* p, void* p16, const float* g, float* mu, float* nu, in
                    float adam_lr, float b1, float b2, float eps, float clip_gn, int clip, float max_norm,
                    const int32_t* block_of_row /*nullable*/, const float* block_lr_mult, const uint8_t* block_frozen,
                    int n_blocks, void* stream);
-/* Schedules: the fixture loader and the formula cross-check (host). */
+/* Schedules: the fixture loader and the formula cross-check (host). config_toml is the path of a TOML config file
+ * (NULL or "" = defaults); n must equal optim.num_steps. *n_ulp_diffs = -1 when the formula refuses the config and
+ * the cross-check is unavailable (optim.hpp ScheduleTables). */
 int nm_schedule_tables(const char* config_toml, int64_t n, int from_fixture, float* lr_host, float* adam_lr_host,
                        float* bc1_host, float* bc2_host, int* n_ulp_diffs);
 

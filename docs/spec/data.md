@@ -110,12 +110,14 @@ sha256, because every id is < 2^17, and mmap it.
 
 ### 2.4 Document format
 
-Each document is stored as `[BOS, text tokens …, EOS]`, with no padding between documents. On two 20M-token windows
-(offset 0 and offset 5,000,000,369; 19,649 and 20,302 whole documents) **[verified]**:
+Each document is stored as `[BOS, text tokens …, EOS]`, with no padding between documents. Over the whole corpus
+(converter check, `docs/BUILD_LOG.md` S1) **[verified]**:
 
 * every document starts with 128000 and ends with 128001;
-* 128000 occurs once elsewhere per window and 128001 occurs once (second window) not at a document end, i.e. these
-  ids appear inside document text, rarely (about 1 in 20,000 documents);
+* 128000 and 128001 occur nowhere else: both counts equal the document count, 9,966,814. BOS and EOS never appear
+  inside document text. (An earlier check on two 20M-token windows counted one extra BOS and one extra EOS per window;
+  those were the partial documents cut by the window edges.) So EOS-derived segments equal document segments on this
+  corpus, and `max_segs_per_seq` at 4096 is 17;
 * min id 0, max id 128001; shortest document 58 tokens; mean 1003.3 tokens over the whole corpus
   (10,000,000,738 / 9,966,814).
 
@@ -155,8 +157,9 @@ row 0 starts `[4, 8834, 23246, 605, 4, 50585, 595, 1912]` (mid-document) **[veri
 
 Consequences a reimplementation must copy:
 
-1. Segments are derived from the **EOS token value**, not from the document offsets. An EOS inside text (section 2.4)
-   starts a new segment; a BOS inside text does not.
+1. Segments are derived from the **EOS token value**, not from the document offsets. An EOS inside text would start a
+   new segment and a BOS inside text would not; this corpus has neither (section 2.4), so both rules give the same
+   segments here. Keep the EOS rule: other corpora may differ.
 2. The EOS token belongs to the segment it ends; the next token (BOS of the next document) opens the new segment.
 3. The loss at the EOS position (predicting the next document's BOS) is **kept** (weight 1). Only position 4095 has
    weight 0.
@@ -504,9 +507,9 @@ not counted here.)
 1. **Cache identity across the 09-24 deletion** (section 2.1). Counts match and the 130m pool reproduced after the
    restore; no token hash of the 09-14 copy exists. All hashes here pin the current copy.
 2. **Segments from EOS vs from offsets** (section 3.1). Levanter uses the EOS token value. A loader that builds
-   segments from document offsets differs on the rare documents with an EOS id inside text. Reading 1 (match
-   levanter): segment boundary after every 128001. Reading 2 (cleaner): boundaries at document offsets. Stage 1 must
-   use reading 1.
+   segments from document offsets would differ on documents with an EOS id inside text; fineweb-edu-10B has none
+   (section 2.4), so the two readings agree on it. Reading 1 (match levanter): segment boundary after every 128001.
+   Reading 2 (cleaner): boundaries at document offsets. Stage 1 uses reading 1.
 3. **bpb aggregation** (section 8.3). Reading 1 (match W&B): token-weighted mean of per-batch bpb with EvalBatch 128 and
    the order of section 8.1. Reading 2 (exact): Σ bits / Σ bytes. Compare to the logged pool with reading 1.
 4. **Original TPU runs.** The launcher reproduces Kaiyue Wen's `qwen3_<size>_muonh_4096_*` runs (2025-10-12, 64 TPU
@@ -537,3 +540,6 @@ Two skeptic reviews, checked against the code and cached W&B data on 2026-10-24.
 | 11 | EvalBatch depends on device count; 8xH100 gives 256 | applied, narrowed (8.2) | `eval_batch_size = per_device_eval_parallelism · data_axis` (`trainer.py:1048-1049`), and it defaults to `per_device_parallelism` (`:1168-1177`). On 8 GPUs, 130m/300m still get 16 · 8 = 128; only 520m/1_2b get 32 · 8 = 256 (unless `PDP` is set). The configs of the 8xH100 runs were not read. The requirement to emulate 128-row batching was added. |
 
 Merge cross-check (2026-10-24): values stated in two or more sections were compared; the corrections are listed in `kaiyue_baseline.md` §C.
+
+Build corrections (S1, 2026-10-24): §2.4, §3.1 item 1 and §9 item 2: BOS and EOS never occur inside document text
+(whole-corpus count by the converter, `docs/BUILD_LOG.md` S1). Applied to `kaiyue_baseline.md` Part 3 as well.

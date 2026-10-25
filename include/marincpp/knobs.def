@@ -83,7 +83,7 @@ NM_KNOB(optim, warmup,      int,         0,          NM_HASH,  "",          v >=
 NM_KNOB(optim, decay,       double,      0.8,        NM_HASH,  "",          v >= -1, "decay length: <=1 fraction of N (int(x*N)), >1 steps, -1 = N - warmup")
 NM_KNOB(optim, min_lr_ratio, double,     0.0,        NM_HASH,  "",          v >= 0 && v <= 1, "end value / peak")
 NM_KNOB(optim, num_steps,   int,         4959,       NM_HASH,  "-n%d",      v >= 1, "updates N")
-NM_KNOB(optim, schedule_fixture, std::string, "",    NM_HASH | NM_CONTENT, "",          true, "dir with f32 sched_main, sched_adam [N] and 1-b1^t, 1-b2^t from jitted optax (tools/levref/schedules.py); required for parity runs")
+NM_KNOB(optim, schedule_fixture, std::string, "",    NM_HASH | NM_CONTENT, "",          true, "dir with f32 sched_main, sched_adam [N] and 1-b1^t, 1-b2^t from jitted optax (tests/s2/schedule_fixture.py); required for parity runs")
 NM_KNOB(optim, weight_decay, double,     0.0,        NM_HASH,  "-wd%g",     v >= 0, "decoupled weight decay actually applied; > 0 with a muonh_qwen3 preset requires optim.wd_variant")
 NM_KNOB(optim, wd_variant,  bool,        false,      NM_HASH,  "-wdv",      true, "acknowledges a weight-decay variant (levanter logs 0.1 but the baseline applies none)")
 NM_KNOB(optim, zero1,       std::string, "auto",     NM_HASH,  "",          one_of(v, {"auto","on","off"}), "ZeRO-1 ownership for every optimizer group (DESIGN.md §6.1); off = replicated optimizer")

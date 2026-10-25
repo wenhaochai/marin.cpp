@@ -104,6 +104,7 @@ eval semantics (P3 §8.2, P4 §1, P6 §1), the 16-domain Paloma counts (P3 §8.1
 | C9 | Which W&B history rows are duplicated | P4 §1 (300m step 10000; 1_2b 10000, 20000); P6 §1 (multiples of 5000) | Different fetches of the same API. Both parts trace them to API pagination; the local `.wandb` files hold each eval once. Values are identical. Rule for every script: dedupe by `_step`. |
 | C10 | Eval tolerance | P4 §8 test 3 (2e-4 nats per domain, trained checkpoint) vs P6 a3 (1e-4, init model) | Different checks; both stand (Parity test plan, T3.2 and T2.3). |
 | C11 | `trainer.py` line numbers | P1 cites run-commit lines (`:97-100`, `:244`); P2, P4 and P5 cite HEAD lines (`:98-101`, `:254`) | Both correct under their stated convention. The 17 added lines shift HEAD numbers by +1 after the import, +10 after HEAD `:116`, +17 after HEAD `:749`. |
+| C12 | T1.2 tolerance for cancelling sums in RMSNorm `dx` | Parity test plan T1.2 ("every element within 1 bf16 ulp") vs the S3 measurement on the 130m XLA:CPU fixture (4 of 524,288 k_norm `dx` elements at 2-4 ulp, all cancelling sums) | Amended 2026-10-24 (controller decision): T1.2 now passes such an element when `|nano - lev| <= 4 x 2^-24 x (|a r| + |c 2x|)`. marincpp does not reproduce XLA's summation order of the row sum `s`, and any other order moves a cancelling `dx` by a few f32 ulps of its addends (`docs/BUILD_LOG.md` S3). |
 
 ---
 
@@ -938,7 +939,10 @@ integer exponent, which takes case 3, `lax.pow(x1, x2)` (`jax/_src/numpy/ufuncs.
 repeated multiplication, is used only for a concrete exponent, `:2682-2690`). The lowering converts the int32 exponent
 to f32 and emits `stablehlo.power(f32, f32)` (`jax/_src/lax/lax.py:4904-4911`). So the denominator is
 `1 - pow_f32(f32(b), f32(t))`, evaluated in f32 by XLA:GPU's f32 pow. It is not repeated multiplication and not a float64
-pow. Which device routine XLA:GPU uses for f32 pow (and so its ulp error) is open (§10). AdamH cancels this factor
+pow. XLA:GPU computes it with libdevice `__nv_powf`, inlined into the fusion (read from the LLVM IR of the schedule
+fixture generator, `docs/BUILD_LOG.md` S2), whose reciprocal step is the hardware approximation `rcp.approx.ftz.f32`. A
+port with a correctly rounded reciprocal differs from it by 1 ulp of `b^t` at small t for rare betas (none of 16 common
+betas at t = 1..2000, measured on sm_80). The schedule fixture (DESIGN.md §4.4) holds the `1 - b^t` tables of record. AdamH cancels this factor
 through the projection, except through `eps`. Plain Adam (embedding, norms) does not.
 
 ### 6. Learning-rate schedules
@@ -961,9 +965,10 @@ k <  992:  η(k) = peak
 k >= 992:  c = clip(k - 992, 0, 3967);  frac = 1 - c/3967;  η(k) = (peak - 0) * frac + 0   # OX/schedules/_schedule.py:142-145
 ```
 
-`c/3967` is an f32 division of the int32 count (converted exactly) by 3967, and `1 - .` is exact in f32. The last
-update, k = 4958, uses `f32(0.02) · (1 − f32(3966/3967))` = **5.041361e-06** (main) and `f32(0.008) · (1 − f32(3966/3967))`
-= **2.016544e-06** (adam), both as logged. These are not the real numbers peak/3967 = 5.04159e-6 and 2.01664e-6: the f32
+XLA:GPU does not divide here: its algebraic simplifier rewrites `c/3967` as `c * f32(1/3967)` (the constant
+0.000252079655 in the optimized HLO), one rounded multiply of the int32 count (converted exactly); `1 - .` is exact in
+f32. An f32 division gives other bits at 261 of the 4959 k. The last update, k = 4958, uses `f32(0.02) · (1 − f32(3966/3967))` = **5.041361e-06** (main) and `f32(0.008) · (1 − f32(3966/3967))`
+= **2.016544e-06** (adam), both as logged (here the multiply by `f32(1/3967)` gives the same bits as the division). These are not the real numbers peak/3967 = 5.04159e-6 and 2.01664e-6: the f32
 rounding of `3966/3967` before the subtraction makes them 4.5e-5 (relative) lower. Computing `peak*(T_d - c)/T_d` or
 `peak/3967` gives different bits at every late step. The rate never reaches 0 during training.
 
@@ -980,8 +985,12 @@ k >= 1000: c = minimum(int32(k - 1000), float(T_d))     # promotes to f32; exact
            η(k) = peak * ((1 - 0) * (0.5 * (1 + cos((f32(pi) * c) / T_d)))**1.0 + 0)   # OX/schedules/_schedule.py:378-388
 ```
 
-`(f32(pi) * c) / T_d` is left-associative, two rounded f32 operations (`_schedule.py:386`), and `cos` is XLA:GPU's f32
-cos. `**1.0` is `stablehlo.power(x, 1.0)`; XLA's algebraic simplifier should fold it to `x` (unverified).
+The source writes `(f32(pi) * c) / T_d` (`_schedule.py:386`), but XLA:GPU's algebraic simplifier folds it into
+`c * f32(f32(pi) * f32(1/T_d))`: one constant (300m: 0.0003008036 = `f32(pi) * f32(1/10444)`) and one rounded multiply
+at run time, not two rounded operations. `cos` is libdevice `__nv_cosf`, inlined into the fusion. `**1.0` is folded to
+`x` (verified in the optimized HLO). The warmup's `c/1000` is likewise `c * f32(1/1000)`. Evaluating the formulas above
+literally in f32 (IEEE division, correctly rounded cos) differs from the logged values at 261 (130m), 3028 (300m), 3118 (520m) and 5569
+(1_2b) logged steps, the first at k = 58, inside the warmup.
 
 The warmup is computed in the form `(init − end)·frac + end`, not `peak·k/1000`. This matters for bits: 300m logs
 2.0000152e-05 at k = 2, which is this form's f32 rounding. At k = 1000, η = peak.
@@ -1000,7 +1009,9 @@ At 1_2b the true value is below half an f32 ulp at −1, so `1 + cos` rounds to 
 reproduces every row (`run-20260914_123815-...-300m`, `run-20260915_170105-...-520m`,
 `run-20260917_142202-...-1_2b` in `cache/wandb/`).
 
-**Lookup table.** A bit-exact port should not trust its own cos, pow and division here. W&B logs the exact f32
+**Lookup table.** The schedule fixture (DESIGN.md §4.4: the jitted optax schedules evaluated on a GPU at every k) is
+the table of record; it replaces the logged table and the hole formulas below, and T0.7 checks it against every logged
+value. A port should not trust its own cos, pow and division here. W&B logs the exact f32
 `optim/learning_rate` and `optim/adam_lr` at `_step` k ≥ 2 (§3 step 3). Load them as a per-k table from the cached
 histories `$ROOT/project/marin.cpp/cache/wandb/run-2026091[4-7]_*-muonh-qwen3-<size>-della4xh100.jsonl.gz`
 (one file per resumed segment; a step re-run after a resume appears once). The table has holes: of k = 2..N−1, 130m
@@ -1094,10 +1105,10 @@ def step(P, G, S, k):                         # P params, G mean grads, S state,
    (`jax/_src/numpy/linalg.py:1276-1277`), the ND projection uses `sqrt(sum(square(.)))` (`util.py:318-321`), and the
    clip norm is `sqrt(sum(jnp.sum(abs_sq(x))))` (`OX/_src/linear_algebra.py:35-39`). They are plain f32 reductions;
    only their reduction order is open (item 4). The model's forward and backward matmuls run in bf16 compute.
-7. **XLA:GPU f32 transcendentals.** The f32 `pow` in the bias correction (§5.3) and the f32 `cos` in the cosine
-   schedule (§6.2) come from XLA:GPU's device routines, whose ulp errors a port will not match by default. For the
-   schedule, use the logged lookup table (§6.2). For `pow`, compare a port's `1 - b**t` for t = 1..N against a jitted
-   JAX run on a GPU node.
+7. **XLA:GPU f32 transcendentals** (resolved by S2). The f32 `pow` in the bias correction (§5.3) and the f32 `cos` in
+   the cosine schedule (§6.2) are libdevice `__nv_powf` and `__nv_cosf`, inlined into the fusion, and divisions by
+   constants become multiplies by f32 reciprocals. The schedule fixture is the record for the schedules and for
+   `1 - b**t`; marincpp's formula ports XLA's arithmetic and cross-checks the fixture (DESIGN.md §4.4).
 2. **"Global norm" clipping is per group** (§3.1). The code is unambiguous. The reading "one norm over all parameters"
    is wrong for this baseline.
 3. **The `"Embedding"` path test never matches** (§2.1). The routing result is the same either way: the embedding goes
@@ -1225,12 +1236,14 @@ sha256, because every id is < 2^17, and mmap it.
 
 #### 2.4 Document format
 
-Each document is stored as `[BOS, text tokens …, EOS]`, with no padding between documents. On two 20M-token windows
-(offset 0 and offset 5,000,000,369; 19,649 and 20,302 whole documents) **[verified]**:
+Each document is stored as `[BOS, text tokens …, EOS]`, with no padding between documents. Over the whole corpus
+(converter check, `docs/BUILD_LOG.md` S1) **[verified]**:
 
 * every document starts with 128000 and ends with 128001;
-* 128000 occurs once elsewhere per window and 128001 occurs once (second window) not at a document end, i.e. these
-  ids appear inside document text, rarely (about 1 in 20,000 documents);
+* 128000 and 128001 occur nowhere else: both counts equal the document count, 9,966,814. BOS and EOS never appear
+  inside document text. (An earlier check on two 20M-token windows counted one extra BOS and one extra EOS per window;
+  those were the partial documents cut by the window edges.) So EOS-derived segments equal document segments on this
+  corpus, and `max_segs_per_seq` at 4096 is 17;
 * min id 0, max id 128001; shortest document 58 tokens; mean 1003.3 tokens over the whole corpus
   (10,000,000,738 / 9,966,814).
 
@@ -1270,8 +1283,9 @@ row 0 starts `[4, 8834, 23246, 605, 4, 50585, 595, 1912]` (mid-document) **[veri
 
 Consequences a reimplementation must copy:
 
-1. Segments are derived from the **EOS token value**, not from the document offsets. An EOS inside text (section 2.4)
-   starts a new segment; a BOS inside text does not.
+1. Segments are derived from the **EOS token value**, not from the document offsets. An EOS inside text would start a
+   new segment and a BOS inside text would not; this corpus has neither (section 2.4), so both rules give the same
+   segments here. Keep the EOS rule: other corpora may differ.
 2. The EOS token belongs to the segment it ends; the next token (BOS of the next document) opens the new segment.
 3. The loss at the EOS position (predicting the next document's BOS) is **kept** (weight 1). Only position 4095 has
    weight 0.
@@ -1619,9 +1633,9 @@ not counted here.)
 1. **Cache identity across the 09-24 deletion** (section 2.1). Counts match and the 130m pool reproduced after the
    restore; no token hash of the 09-14 copy exists. All hashes here pin the current copy.
 2. **Segments from EOS vs from offsets** (section 3.1). Levanter uses the EOS token value. A loader that builds
-   segments from document offsets differs on the rare documents with an EOS id inside text. Reading 1 (match
-   levanter): segment boundary after every 128001. Reading 2 (cleaner): boundaries at document offsets. Stage 1 must
-   use reading 1.
+   segments from document offsets would differ on documents with an EOS id inside text; fineweb-edu-10B has none
+   (section 2.4), so the two readings agree on it. Reading 1 (match levanter): segment boundary after every 128001.
+   Reading 2 (cleaner): boundaries at document offsets. Stage 1 uses reading 1.
 3. **bpb aggregation** (section 8.3). Reading 1 (match W&B): token-weighted mean of per-batch bpb with EvalBatch 128 and
    the order of section 8.1. Reading 2 (exact): Σ bits / Σ bytes. Compare to the logged pool with reading 1.
 4. **Original TPU runs.** The launcher reproduces Kaiyue Wen's `qwen3_<size>_muonh_4096_*` runs (2025-10-12, 64 TPU
@@ -3226,7 +3240,7 @@ T2 to T6 restate `targets.md` §4 (Part 6) with the fixture recipe added; T0 and
 | T0.4 | Paloma eval set | the 16 per-domain sha256 of `data.md` §8.1, 14,529 sequences, 114 batches of 128, 63 zero rows in batch 113 | `data.md` §8.1 table (made by the same script) |
 | T0.5 | Bytes-per-token table | sha256 `d3be7450...4e4d`, all 128,256 entries (`data.md` §8.4, `eval.md` §8 test 1) | `cache/data/bytes_per_token_marin.i32`; recheck against `levanter.utils.hf_utils.byte_length_of_token` on della-vis1 |
 | T0.6 | Optimizer scalar constants | f32 bit patterns equal to the hex column of `optim.md` §5.3 | that table (numpy float32 on della-vis1) |
-| T0.7 | Schedules eta(k), eta_adam(k), k = 0..N-1, all four sizes | f32-bitwise equal to the logged `optim/learning_rate` and `optim/adam_lr` at every logged k; at the holes and k = 0, 1, equal to the formulas of `optim.md` §6. Includes 130m k = 4958: 5.041361e-06 / 2.016544e-06; 1_2b k = 22887: exactly 0 | cached histories `cache/wandb/run-2026091[4-7]_*-muonh-qwen3-<size>-della4xh100.jsonl.gz` (dedupe by `_step`) |
+| T0.7 | Schedules eta(k), eta_adam(k), k = 0..N-1, all four sizes | f32-bitwise equal to the logged `optim/learning_rate` and `optim/adam_lr` at every logged k; at the holes and k = 0, 1, equal to `optim.md` §6 as XLA:GPU computes it (marincpp `build_schedules`, §6.2) and inside their logged neighbours. Includes 130m k = 4958: 5.041361e-06 / 2.016544e-06; 1_2b k = 22887: exactly 0 | cached histories `cache/wandb/run-2026091[4-7]_*-muonh-qwen3-<size>-della4xh100.jsonl.gz` (dedupe by `_step`) |
 | T0.8 | Parameter count and `flops_per_example` | exact integers of the hyperparameter table | W&B `parameter_count`, `throughput/flops_per_example` (cached `cache/wandb/api/*.json`) |
 
 ### T1. Unit kernels against levanter on fixed inputs (pli-cp, 1 GPU)
@@ -3240,7 +3254,7 @@ and hd 128 GQA); attention also at the 520m configuration (hd 64 GQA). All outpu
 |---|---|---|---|
 | T1.0 | Precision facts | Read from the optimized HLO of one 130m train step: (1) dtype of the cross-GPU gradient reductions, (2) whether the CE backward logit dot keeps its bf16 output, (3) embedding scatter accumulator dtype, (4) norm-gain `reduce_sum` accumulator dtype, (5) whether f32 dots (Newton-Schulz, flash `dV`) run as TF32, (6) `xla_gpu_ftz` and fast-math options; record loaded `libcublas`, `libcudnn`, `libnccl`. These facts fix the tolerance class of T1.4-T1.6 (`numerics.md` §10, O1, O2) | harness runs one full-N 130m step on 4 GPUs with `XLA_FLAGS="--xla_dump_to=<dir> --xla_dump_hlo_as_text"` and `LD_DEBUG=libs` |
 | T1.1 | Init | Port of threefry2x32 (partitionable) plus the uniform-to-`erf_inv` sampler (`model.md` §4.2): every tensor bitwise equal. Otherwise, per tensor of `model.md` §4.1: `abs(std / (0.98658 x scale) - 1) <= 5 / sqrt(2 x numel)`; `abs(mean) <= 5 x 0.98658 x scale / sqrt(numel)`; `max abs(w) < 3 x scale`; norm gains exactly 1. In both cases: `lm_head / embedding = sqrt(D)` elementwise to `<= 2.4e-7` relative (one shared draw, two f32 scalings), so their correlation is 1, never 0 | harness: `trainer.initial_state(training_key, model_init=...)` exactly as `train_lm.py:268` (seed 0, `jax_threefry_partitionable=True`); saves `state.model` as a levanter tensorstore checkpoint plus per-tensor stats JSON (`targets.md` §4(a) fixture 1) |
-| T1.2 | RMSNorm (block norm over D, QK-norm over hd) | forward `out` and backward `dx`: at least 99% of elements bitwise equal and every element within 1 bf16 ulp of levanter (elementwise math with fixed rounding points, `numerics.md` §3.2); gain gradient `dg` (bf16 reduction over 524,288 positions): oracle rule | harness calls `haliax.nn.RMSNorm` from `LlamaConfig.norm_config` (`levanter/layers/normalization.py:35-39`) under `jax.vjp` |
+| T1.2 | RMSNorm (block norm over D, QK-norm over hd) | forward `out` and backward `dx`: at least 99% of elements bitwise equal and every element within 1 bf16 ulp of levanter (elementwise math with fixed rounding points, `numerics.md` §3.2), except cancelling sums: an element of `dx` beyond 1 bf16 ulp passes when `|nano - lev| <= 4 x 2^-24 x (|a r| + |c 2x|)`, with the two addends of `dx = bf16(a r + c 2x)` (`numerics.md` §3.2; `a = bf16(g dy)`) computed in f64 from the bf16 inputs. Reason: where the addends cancel (|dx| about 1e-5 of them), any summation order of the row sum `s` other than XLA's moves `dx` by a few f32 ulps of the addends, which is many bf16 ulps of `dx`; levanter itself is 5-10 bf16 ulps from f64 there. On the 130m XLA:CPU fixture this covers 4 of 524,288 k_norm `dx` elements (2-4 ulp; measured 2.32 f32 ulps of the addends); gain gradient `dg` (bf16 reduction over 524,288 positions): oracle rule | harness calls `haliax.nn.RMSNorm` from `LlamaConfig.norm_config` (`levanter/layers/normalization.py:35-39`) under `jax.vjp` |
 | T1.3 | RoPE | f32 `inv_freq` (built as `numerics.md` §3.3) bitwise; bf16 cos and sin tables `[4096, hd]` for hd 64 and 128 bitwise; rotated q and k bitwise | harness calls `DefaultRotaryEmbeddings` (`levanter/layers/rotary.py:30-46`) with positions 0..4095 (`numerics.md` O4) |
 | T1.4 | Attention (QK-norm, RoPE, scale, flash) on q, k, v of batch-0 rows 0-1 with their EOS-derived segment ids | scale constant bf16 `0x3E00` (hd 64) or `0x3DB5` (hd 128), applied to q before the kernel and to dq after it; output O, log-normalizer L, dq, dk, dv: oracle rule, where the oracle is f64 causal and same-segment softmax attention. A row's output must not depend on keys of other segments (the oracle rule enforces it) | harness calls `levanter.models.flash_attention.flash_attention` through `Attention` with `AttentionBackend.JAX_FLASH`, block 1024, `upcast_attn=False` (`numerics.md` §4) |
 | T1.5 | Fused cross-entropy on x = final-normed hidden states `[131072, D]` (one GPU's rows of batch 0), W = init `lm_head`, labels = next tokens, weights per `data.md` §3.1 | forward per-token loss: `max abs diff <= 2e-5` nats (both sides use f32 logits from a bf16 GEMM and an f32 full-vocab logsumexp; only accumulation order differs); weighted mean: `abs diff <= 1e-6` relative; `grad_x`, `grad_w`: oracle rule (oracle: f64 softmax minus one-hot, times `1/524160`) | harness calls `maybe_fused_next_token_loss` (`levanter/models/loss.py:35-98`), which takes the H100 `batched_xla` B-tiled path (8192-row tiles) under `jax.vjp` |

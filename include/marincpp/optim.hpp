@@ -14,15 +14,18 @@
 namespace nm {
 
 // ------------------------------------------------------------------------------------------------ schedules
-// The tables of record come from a fixture (optim.schedule_fixture): tools/levref/schedules.py runs the jitted optax
-// schedules of the levanter config on a GPU (XLA:GPU f32 cos and pow; the same code on sm_80 and sm_90) and dumps
-// sched_main(k), sched_adam(k) for k = 0..N-1 and 1 - b1^t, 1 - b2^t for t = 1..N. T0.7 checks the fixture against
-// every logged W&B value bitwise.
-// build_schedules() evaluates optim.md §6 on the host (-ffp-contract=off, exact f32 operation order):
-//   linear (130m):  k < stable: peak; else c = clip(k - stable, 0, T_d); frac = 1 - f32(c)/f32(T_d);
+// The tables of record come from a fixture (optim.schedule_fixture): tests/s2/schedule_fixture.py runs the jitted
+// optax schedules of the levanter config on a GPU and dumps sched_main(k), sched_adam(k) for k = 0..N-1 and
+// 1 - b1^t, 1 - b2^t for t = 1..N. T0.7 checks the fixture against every logged W&B value bitwise.
+// build_schedules() (src/sched) evaluates optim.md §6 on the host (-ffp-contract=off) in XLA:GPU's f32 operation
+// order (x / C is x * f32(1/C); cos, pow = ports of libdevice __nv_cosf, __nv_powf; DESIGN.md §4.4):
+//   linear (130m):  k < stable: peak; else c = clip(k - stable, 0, T_d); frac = 1 - f32(c) * f32(1/T_d);
 //                   eta = (peak - end) * frac + end
-//   warmup+cosine:  k < W: c = clip(k, 0, W); eta = (0 - peak) * (1 - f32(c)/f32(W)) + peak
-//                   else c = min(k - W, T_d); eta = peak * ((1 - 0) * (0.5f * (1 + cos((f32(pi) * c) / T_d))) + 0)
+//   warmup+cosine:  k < W: c = clip(k, 0, W); eta = (0 - peak) * (1 - f32(c) * f32(1/W)) + peak
+//                   else c = min(k - W, T_d);
+//                   eta = peak * ((1 - 0) * (0.5f * (1 + cos(f32(c) * f32(f32(pi) * f32(1/T_d))))) + 0)
+//   bias correction: 1 - powf(f32(b), f32(t)); the port takes powf's rcp.approx.ftz.f32 as the correctly rounded
+//                   reciprocal (1 ulp of b^t at small t for rare betas; src/sched/sched.hpp).
 // With a fixture it is only a cross-check that counts ulp differences (logged); it never overrides a fixture value.
 // Without a fixture (non-parity runs) the formula is used and events.jsonl records schedule_source = formula.
 struct ScheduleTables {
@@ -30,8 +33,8 @@ struct ScheduleTables {
   std::vector<float> adam_lr;   // Adam eta_a(k)
   std::vector<float> bc1, bc2;  // 1 - b^t at t = k + 1
   std::string source;           // "fixture:<sha256>" or "formula"
-  int n_ulp_diffs = 0;          // formula vs fixture
-  int max_ulp_diff = 0;
+  int n_ulp_diffs = 0;          // formula vs fixture; -1 = cross-check unavailable (the formula refuses the config:
+  int max_ulp_diff = 0;         //   optim.warmup = 1, optim.num_steps >= 2^24, a beta whose f32 is 1; the fixture is kept)
 };
 ScheduleTables load_schedules(const Config& c);   // fixture if set (required when run.parity), else formula
 ScheduleTables build_schedules(const Config& c);  // the formula alone
