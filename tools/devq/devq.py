@@ -74,7 +74,7 @@ def ensure(a=None):
                     break
             else:
                 unfit += g
-        need = min(8, unfit)
+        need = 8 if unfit >= 8 else 4 if unfit >= 4 else unfit  # whole 4-GPU blocks; the rest waits for a slot
         if [q[1] for q in queued] == [need] or (need <= 0 and not queued):
             return
         # merge: one runner sized to all waiting work beats several small ones (a full 4-GPU block starts sooner on a
