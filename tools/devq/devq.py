@@ -80,7 +80,7 @@ def ensure(a=None):
         if need <= 0:
             return
         out = subprocess.run(["bash", os.path.join(HERE, "submit_wq.sh"), "1", str(need)], capture_output=True, text=True,
-                             env=dict(os.environ, NANOMARIN_ROOT=ROOT))
+                             env=dict(os.environ, NANOMARIN_ROOT=ROOT, DEVQ_ENSURE="1"))
         wid = (out.stdout.strip().split() or [""])[-1]
         if out.returncode == 0 and wid.startswith("w"):
             print(f"[devq] queued a {need}-GPU wq runner {wid}", file=sys.stderr)

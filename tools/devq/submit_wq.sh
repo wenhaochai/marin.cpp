@@ -3,6 +3,9 @@
 # Usage: NANOMARIN_ROOT=<scratch root> tools/devq/submit_wq.sh [N] [GPUS]   (GPUS per runner, default 4)
 set -euo pipefail
 : "${NANOMARIN_ROOT:?set NANOMARIN_ROOT}"
+# Only devq's ensure() may queue runners: it sizes them to the pending work. Agents: use `devq.py submit`, which
+# queues a runner when needed (hand-queued runners over-filled the queue on 2026-10-25).
+[ "${DEVQ_ENSURE:-}" = 1 ] || { echo "submit_wq.sh: refused. Use tools/devq/devq.py submit; it queues a right-sized runner itself." >&2; exit 2; }
 n=${1:-1}
 g=${2:-4}
 here=$(cd "$(dirname "$0")" && pwd)
