@@ -6,6 +6,7 @@ pli-cp salloc, released as soon as the work ends; never one Slurm job per test).
                                                                with spaces: put anything with quotes in a script)
   devq.py wait ID [ID...]                                      block until done; print rc and log path
   devq.py ls                                                   pending / running / done
+  devq.py ensure                                               make sure an H100 runner is alive or queued
   devq.py runner --gpus G [--idle-exit 1200] [--deadline S]    run inside the allocation (srun --overlap, or a
                                                                wq job with DEVQ_NO_SCANCEL=1)
 
@@ -13,19 +14,60 @@ Queue directory: $DEVQ_DIR (default $NANOMARIN_ROOT/tmp/devq). The runner gives 
 CUDA_VISIBLE_DEVICES, a per-task TMPDIR on scratch, `module load proxy/default` and HF offline env.
 When nothing is pending or running for --idle-exit seconds, the runner cancels its own allocation, so GPUs
 never sit idle long enough for the 30-min idle warning.
+Auto runner: submitting an h100/any task (and a runner that exits with runnable tasks left) calls `ensure`: if no
+H100 runner has a fresh heartbeat and no wq runner job is queued or running, it queues one with submit_wq.sh
+(wq --prio 20). Set DEVQ_AUTO_WQ=0 to turn this off.
 """
-import argparse, json, os, subprocess, sys, time
+import argparse, fcntl, json, os, subprocess, sys, time
 
 ROOT = os.environ.get("NANOMARIN_ROOT")
 if not ROOT:
     sys.exit("set NANOMARIN_ROOT")
 QDIR = os.environ.get("DEVQ_DIR", os.path.join(ROOT, "tmp", "devq"))
 SUB = {k: os.path.join(QDIR, k) for k in ("pending", "running", "done")}
+HB = os.path.join(QDIR, "runners")  # one heartbeat file per live runner
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def _mk():
-    for d in SUB.values():
+    for d in list(SUB.values()) + [HB]:
         os.makedirs(d, exist_ok=True)
+
+
+def ensure(a=None):
+    """Queue a wq runner unless an H100 runner is alive (fresh heartbeat) or a wq runner job is queued/running."""
+    _mk()
+    if os.environ.get("DEVQ_AUTO_WQ", "1") != "1":
+        return
+    fd = os.open(os.path.join(QDIR, "ensure.lock"), os.O_RDWR | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        now = time.time()
+        for fn in os.listdir(HB):
+            try:
+                hb = json.load(open(os.path.join(HB, fn)))
+            except (OSError, ValueError):
+                continue
+            if hb.get("arch") == "h100" and now - hb.get("t", 0) < 120:
+                return
+        wqf = os.path.join(QDIR, "wq_runner.json")
+        wq = os.path.join(ROOT, "tools", "wq", "wq")
+        if os.path.exists(wqf):
+            wid = json.load(open(wqf)).get("id", "")
+            st = subprocess.run([wq, "state", wid], capture_output=True, text=True).stdout.strip()
+            if st in ("queued", "running"):
+                return
+        out = subprocess.run(["bash", os.path.join(HERE, "submit_wq.sh"), "1"], capture_output=True, text=True,
+                             env=dict(os.environ, NANOMARIN_ROOT=ROOT))
+        wid = (out.stdout.strip().split() or [""])[-1]
+        if out.returncode == 0 and wid.startswith("w"):
+            json.dump({"id": wid, "t": now}, open(wqf, "w"))
+            print(f"[devq] queued wq runner {wid}", file=sys.stderr)
+        else:
+            print(f"[devq] could not queue a wq runner: {out.stdout} {out.stderr}", file=sys.stderr)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def _next_id():
@@ -52,6 +94,8 @@ def submit(a):
         json.dump(task, f)
     os.rename(tmp, os.path.join(SUB["pending"], f"{tid}.json"))
     print(tid)
+    if a.arch in ("h100", "any"):
+        ensure()
 
 
 def _state(tid):
@@ -95,7 +139,10 @@ def runner(a):
         sys.exit(f"runner: asked for {a.gpus} GPUs, CUDA_VISIBLE_DEVICES has {len(free)}")
     procs = {}  # tid -> (Popen, task, devices)
     idle_since = t0 = time.time()
+    hbf = os.path.join(HB, f"{job}-{os.getpid()}.json")
     while True:
+        json.dump({"arch": a.arch, "gpus": a.gpus, "job": job, "t": time.time()}, open(hbf + ".tmp", "w"))
+        os.replace(hbf + ".tmp", hbf)
         draining = a.deadline and time.time() - t0 > a.deadline
         # reap
         for tid, (p, t, devs) in list(procs.items()):
@@ -152,11 +199,15 @@ def runner(a):
             print(f"[devq] start {tid} {t['name']} gpus={devs}", flush=True)
         if draining and not procs:
             print(f"[devq] deadline {a.deadline}s reached, all tasks ended: exiting", flush=True)
+            os.remove(hbf)
+            if mine and a.arch == "h100":
+                ensure()  # runnable tasks remain: queue a successor
             return
         if procs or (mine and not draining):
             idle_since = time.time()
         elif time.time() - idle_since > a.idle_exit:
             print(f"[devq] idle {a.idle_exit}s: releasing allocation {job}", flush=True)
+            os.remove(hbf)
             if os.environ.get("DEVQ_NO_SCANCEL") != "1":
                 subprocess.run(["scancel", job])
             return
@@ -176,6 +227,7 @@ def main():
     w = sp.add_parser("wait")
     w.add_argument("ids", nargs="+")
     sp.add_parser("ls")
+    sp.add_parser("ensure")
     r = sp.add_parser("runner")
     r.add_argument("--gpus", type=int, required=True)
     r.add_argument("--idle-exit", type=int, default=1200)
@@ -187,7 +239,7 @@ def main():
             a.cmd = a.cmd[1:]
         if not a.cmd:
             sys.exit("no command")
-    {"submit": submit, "wait": wait, "ls": ls, "runner": runner}[a.c](a)
+    {"submit": submit, "wait": wait, "ls": ls, "runner": runner, "ensure": ensure}[a.c](a)
 
 
 if __name__ == "__main__":
