@@ -35,7 +35,9 @@ def _mk():
 
 
 def ensure(a=None):
-    """Queue a wq runner unless an H100 runner is alive (fresh heartbeat) or a wq runner job is queued/running."""
+    """For every GPU count that pending h100/any tasks need, make sure a runner of exactly that size is alive (fresh
+    heartbeat) or queued in wq; queue one otherwise. Runners take only tasks of their own size (plus CPU-only tasks),
+    so a big runner never idles GPUs while it runs a small task."""
     _mk()
     if os.environ.get("DEVQ_AUTO_WQ", "1") != "1":
         return
@@ -43,36 +45,41 @@ def ensure(a=None):
     fcntl.flock(fd, fcntl.LOCK_EX)
     try:
         now = time.time()
+        sizes = set()
+        for fn in os.listdir(SUB["pending"]):
+            try:
+                t = json.load(open(os.path.join(SUB["pending"], fn)))
+            except (OSError, ValueError):
+                continue
+            if t.get("arch", "h100") in ("h100", "any") and int(t.get("gpus", 1)) > 0:
+                sizes.add(min(4, int(t["gpus"])))
+        alive = set()
         for fn in os.listdir(HB):
             try:
                 hb = json.load(open(os.path.join(HB, fn)))
             except (OSError, ValueError):
                 continue
             if hb.get("arch") == "h100" and now - hb.get("t", 0) < 120:
-                return
-        wqf = os.path.join(QDIR, "wq_runner.json")
+                alive.add(int(hb.get("gpus", 0)))
+        wqf = os.path.join(QDIR, "wq_runners.json")  # {gpus: wq id}
+        try:
+            queued = json.load(open(wqf))
+        except (OSError, ValueError):
+            queued = {}
         wq = os.path.join(ROOT, "tools", "wq", "wq")
-        if os.path.exists(wqf):
-            wid = json.load(open(wqf)).get("id", "")
-            st = subprocess.run([wq, "state", wid], capture_output=True, text=True).stdout.strip()
-            if st in ("queued", "running"):
-                return
-        need = 1
-        for fn in os.listdir(SUB["pending"]):
-            try:
-                t = json.load(open(os.path.join(SUB["pending"], fn)))
-            except (OSError, ValueError):
+        for g in sorted(sizes - alive):
+            wid = queued.get(str(g), "")
+            if wid and subprocess.run([wq, "state", wid], capture_output=True, text=True).stdout.strip() in ("queued", "running"):
                 continue
-            if t.get("arch", "h100") in ("h100", "any"):
-                need = max(need, min(4, int(t.get("gpus", 1))))
-        out = subprocess.run(["bash", os.path.join(HERE, "submit_wq.sh"), "1", str(need)], capture_output=True, text=True,
-                             env=dict(os.environ, NANOMARIN_ROOT=ROOT))
-        wid = (out.stdout.strip().split() or [""])[-1]
-        if out.returncode == 0 and wid.startswith("w"):
-            json.dump({"id": wid, "t": now}, open(wqf, "w"))
-            print(f"[devq] queued wq runner {wid}", file=sys.stderr)
-        else:
-            print(f"[devq] could not queue a wq runner: {out.stdout} {out.stderr}", file=sys.stderr)
+            out = subprocess.run(["bash", os.path.join(HERE, "submit_wq.sh"), "1", str(g)], capture_output=True, text=True,
+                                 env=dict(os.environ, NANOMARIN_ROOT=ROOT))
+            wid = (out.stdout.strip().split() or [""])[-1]
+            if out.returncode == 0 and wid.startswith("w"):
+                queued[str(g)] = wid
+                print(f"[devq] queued a {g}-GPU wq runner {wid}", file=sys.stderr)
+            else:
+                print(f"[devq] could not queue a {g}-GPU wq runner: {out.stdout} {out.stderr}", file=sys.stderr)
+        json.dump(queued, open(wqf, "w"))
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
@@ -206,8 +213,8 @@ def runner(a):
                 continue
             if t.get("arch", "h100") not in ("any", a.arch):
                 continue  # e.g. an H100-only measurement on an A100 runner
-            if t["gpus"] > a.gpus:
-                continue  # leave it for a runner with more GPUs
+            if t["gpus"] not in (0, a.gpus):
+                continue  # only tasks of this runner's size, so no GPU of it idles under a smaller task
             mine += 1
             if draining or blocked or t["gpus"] > len(free):
                 blocked = True  # FIFO: the first task that does not fit waits for GPUs
