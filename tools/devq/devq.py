@@ -35,9 +35,8 @@ def _mk():
 
 
 def ensure(a=None):
-    """Queue one wq runner for the pending h100/any GPU demand that live runners (free GPUs, fresh heartbeat) and the
-    queued runner cannot absorb, sized to that demand (1-8 GPUs). Runners pack tasks side by side, so the demand
-    of several small tasks fills one runner instead of leaving GPUs of a host idle."""
+    """Keep exactly one queued wq runner, sized (1-8 GPUs) to the pending h100/any tasks that do not first-fit into the
+    free GPUs of live runners; queued runners of another size are replaced. Runners pack tasks side by side."""
     _mk()
     if os.environ.get("DEVQ_AUTO_WQ", "1") != "1":
         return
@@ -53,7 +52,7 @@ def ensure(a=None):
                 continue
             if t.get("arch", "h100") in ("h100", "any") and int(t.get("gpus", 1)) > 0:
                 tasks.append(int(t["gpus"]))
-        bins = []  # free GPUs of each live runner, and the size of each queued runner
+        bins = []  # free GPUs of each live runner
         for fn in os.listdir(HB):
             try:
                 hb = json.load(open(os.path.join(HB, fn)))
@@ -62,21 +61,26 @@ def ensure(a=None):
             if hb.get("arch") == "h100" and now - hb.get("t", 0) < 120:
                 bins.append(int(hb.get("free", 0)))
         wq = os.path.join(ROOT, "tools", "wq", "wq")
-        ls = subprocess.run([wq, "ls"], capture_output=True, text=True).stdout
-        for line in ls.splitlines():  # every queued runner counts
+        queued = []  # (wq id, GPUs) of runners queued in wq and not started yet
+        for line in subprocess.run([wq, "ls"], capture_output=True, text=True).stdout.splitlines():
             f = line.split()
             if len(f) >= 6 and f[2] == "marincpp-devq" and f[5] == "queued":
-                bins.append(int(f[3]))
+                queued.append((f[0], int(f[3])))
         unfit = 0
-        for g in sorted(tasks, reverse=True):  # first fit, largest task first: a task fits one runner or none
+        for g in sorted(tasks, reverse=True):  # first fit into live runners, largest task first
             for i, room in enumerate(bins):
                 if room >= g:
                     bins[i] -= g
                     break
             else:
                 unfit += g
-        demand, free = unfit, 0
-        need = min(8, demand - free)
+        need = min(8, unfit)
+        if [q[1] for q in queued] == [need] or (need <= 0 and not queued):
+            return
+        # merge: one runner sized to all waiting work beats several small ones (a full 4-GPU block starts sooner on a
+        # pilot host, and the tasks pack side by side), so replace the runners that have not started yet
+        for wid, _ in queued:
+            subprocess.run([wq, "cancel", wid], capture_output=True, text=True)
         if need <= 0:
             return
         out = subprocess.run(["bash", os.path.join(HERE, "submit_wq.sh"), "1", str(need)], capture_output=True, text=True,
