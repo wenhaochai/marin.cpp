@@ -6,10 +6,10 @@
 #SBATCH --comment=fetchable
 #FETCHABLE
 # A devq runner as a wq job (@GPUS@ GPUs, <= 3 h): runs queued marin.cpp test tasks, stops claiming new ones 50 min
-# before its time limit, and exits after 20 min with nothing to run. Never scancels (it shares a pilot host).
+# before its time limit, and exits after 10 min with nothing to run. Never scancels (it shares a pilot host).
 # Template: tools/devq/submit_wq.sh fills @ROOT@ and submits it.
 set -uo pipefail
 ROOT=@ROOT@
 export NANOMARIN_ROOT=$ROOT DEVQ_NO_SCANCEL=1
 nvidia-smi -L
-exec python3 $ROOT/project/marin.cpp/tools/devq/devq.py runner --gpus @GPUS@ --arch h100 --idle-exit 1200 --deadline 7200
+exec python3 $ROOT/project/marin.cpp/tools/devq/devq.py runner --gpus @GPUS@ --arch h100 --idle-exit 600 --deadline 7200
