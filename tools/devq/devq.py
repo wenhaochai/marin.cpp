@@ -45,30 +45,37 @@ def ensure(a=None):
     fcntl.flock(fd, fcntl.LOCK_EX)
     try:
         now = time.time()
-        demand = 0
+        tasks = []  # GPU counts of pending tasks a runner could take
         for fn in os.listdir(SUB["pending"]):
             try:
                 t = json.load(open(os.path.join(SUB["pending"], fn)))
             except (OSError, ValueError):
                 continue
-            if t.get("arch", "h100") in ("h100", "any"):
-                demand += int(t.get("gpus", 1))
-        free = 0
+            if t.get("arch", "h100") in ("h100", "any") and int(t.get("gpus", 1)) > 0:
+                tasks.append(int(t["gpus"]))
+        bins = []  # free GPUs of each live runner, and the size of each queued runner
         for fn in os.listdir(HB):
             try:
                 hb = json.load(open(os.path.join(HB, fn)))
             except (OSError, ValueError):
                 continue
             if hb.get("arch") == "h100" and now - hb.get("t", 0) < 120:
-                free += int(hb.get("free", 0))
-        wqf = os.path.join(QDIR, "wq_runner_pending.json")  # the one runner queued in wq and not started yet
+                bins.append(int(hb.get("free", 0)))
         wq = os.path.join(ROOT, "tools", "wq", "wq")
-        try:
-            q = json.load(open(wqf))
-            if subprocess.run([wq, "state", q["id"]], capture_output=True, text=True).stdout.strip() == "queued":
-                free += int(q["gpus"])
-        except (OSError, ValueError, KeyError):
-            pass
+        ls = subprocess.run([wq, "ls"], capture_output=True, text=True).stdout
+        for line in ls.splitlines():  # every queued runner counts
+            f = line.split()
+            if len(f) >= 6 and f[2] == "marincpp-devq" and f[5] == "queued":
+                bins.append(int(f[3]))
+        unfit = 0
+        for g in sorted(tasks, reverse=True):  # first fit, largest task first: a task fits one runner or none
+            for i, room in enumerate(bins):
+                if room >= g:
+                    bins[i] -= g
+                    break
+            else:
+                unfit += g
+        demand, free = unfit, 0
         need = min(8, demand - free)
         if need <= 0:
             return
@@ -76,7 +83,6 @@ def ensure(a=None):
                              env=dict(os.environ, NANOMARIN_ROOT=ROOT))
         wid = (out.stdout.strip().split() or [""])[-1]
         if out.returncode == 0 and wid.startswith("w"):
-            json.dump({"id": wid, "gpus": need, "t": now}, open(wqf, "w"))
             print(f"[devq] queued a {need}-GPU wq runner {wid}", file=sys.stderr)
         else:
             print(f"[devq] could not queue a {need}-GPU wq runner: {out.stdout} {out.stderr}", file=sys.stderr)
