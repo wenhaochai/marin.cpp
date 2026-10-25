@@ -57,7 +57,15 @@ def ensure(a=None):
             st = subprocess.run([wq, "state", wid], capture_output=True, text=True).stdout.strip()
             if st in ("queued", "running"):
                 return
-        out = subprocess.run(["bash", os.path.join(HERE, "submit_wq.sh"), "1"], capture_output=True, text=True,
+        need = 1
+        for fn in os.listdir(SUB["pending"]):
+            try:
+                t = json.load(open(os.path.join(SUB["pending"], fn)))
+            except (OSError, ValueError):
+                continue
+            if t.get("arch", "h100") in ("h100", "any"):
+                need = max(need, min(4, int(t.get("gpus", 1))))
+        out = subprocess.run(["bash", os.path.join(HERE, "submit_wq.sh"), "1", str(need)], capture_output=True, text=True,
                              env=dict(os.environ, NANOMARIN_ROOT=ROOT))
         wid = (out.stdout.strip().split() or [""])[-1]
         if out.returncode == 0 and wid.startswith("w"):
@@ -130,6 +138,19 @@ def ls(a):
                 print(k, t["id"], t["name"], f"gpus={t['gpus']}", t.get("arch", "h100"), f"rc={t.get('rc', '')}", t.get("devices", ""))
 
 
+IDLE_KILL = int(os.environ.get("DEVQ_IDLE_KILL", "900"))  # a task whose GPU sits at 0% this long is killed
+
+
+def _gpu_util():
+    """{physical GPU index (str): utilization %} from nvidia-smi; {} if it fails."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index,utilization.gpu", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=30).stdout
+        return {l.split(",")[0].strip(): float(l.split(",")[1]) for l in out.splitlines() if "," in l}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {}
+
+
 def runner(a):
     _mk()
     job = os.environ.get("SLURM_JOB_ID", "nojob")
@@ -138,6 +159,8 @@ def runner(a):
     if len(free) < a.gpus:
         sys.exit(f"runner: asked for {a.gpus} GPUs, CUDA_VISIBLE_DEVICES has {len(free)}")
     procs = {}  # tid -> (Popen, task, devices)
+    busy = {}   # GPU -> last time it was seen above 0% (or its task's start)
+    last_poll = 0.0
     idle_since = t0 = time.time()
     hbf = os.path.join(HB, f"{job}-{os.getpid()}.json")
     while True:
@@ -145,6 +168,21 @@ def runner(a):
         os.replace(hbf + ".tmp", hbf)
         draining = a.deadline and time.time() - t0 > a.deadline
         # reap
+        if procs and time.time() - last_poll > 60:  # idle watchdog: never let a hung task idle a GPU for long
+            last_poll = time.time()
+            util = _gpu_util()
+            for tid, (p, t, devs) in list(procs.items()):
+                for g in devs:
+                    if util.get(g, 100.0) > 0:
+                        busy[g] = last_poll
+                stale = [g for g in devs if last_poll - busy.get(g, t["start"]) > IDLE_KILL]
+                if stale and p.poll() is None:
+                    t["error"] = f"killed by the idle watchdog: GPU {','.join(stale)} at 0% for > {IDLE_KILL} s"
+                    print(f"[devq] {tid} {t['name']}: {t['error']}", flush=True)
+                    try:
+                        os.killpg(p.pid, 15)
+                    except ProcessLookupError:
+                        pass
         for tid, (p, t, devs) in list(procs.items()):
             rc = p.poll()
             if rc is None:
@@ -194,7 +232,10 @@ def runner(a):
                 f"rc=$?; rm -rf {tmpdir}; exit $rc\n")
             t.update(start=time.time(), log=log, devices=devs, job=job)
             json.dump(t, open(os.path.join(SUB["running"], fn), "w"))
-            p = subprocess.Popen(["bash", "-lc", script], stdout=open(log, "w"), stderr=subprocess.STDOUT)
+            p = subprocess.Popen(["bash", "-lc", script], stdout=open(log, "w"), stderr=subprocess.STDOUT,
+                                 start_new_session=True)  # own process group, so the watchdog can kill the tree
+            for g in devs:
+                busy[g] = time.time()
             procs[tid] = (p, t, devs)
             print(f"[devq] start {tid} {t['name']} gpus={devs}", flush=True)
         if draining and not procs:
