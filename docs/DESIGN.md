@@ -1,7 +1,9 @@
 # marincpp design, version 2
 
-Date 2026-10-24. Status: design and headers only; no implementation exists yet. Version 2 applies the perf, parity
-and research reviews of version 1; the Review log (Appendix A) lists every point and what happened to it.
+Date 2026-10-24. Version 2 applies the perf, parity and research reviews of version 1; the Review log (Appendix A)
+lists every point and what happened to it. Update 2026-10-25 (version 2.1): the first H100 measurements
+(`docs/bench/RESULTS.md`) decide O3, O4 and O10, narrow O1, O2, O5, O8 and O9, and give the measured budget of §12.2b;
+Appendix A part B lists each change.
 
 This document fixes the architecture of the marincpp training binary: one C++/CUDA process that trains the Kaiyue
 muonh_qwen3 models (130m to 1.2B) and the pls d48 readout models on one node with at most 8 H100 SXM GPUs. The module
@@ -24,24 +26,26 @@ Binding owner decisions:
 | 2 | Memory | One static arena per GPU, planned on the CPU from the config; no allocation after start | none |
 | 3 | Graphs | The whole update (forward, backward, reductions, optimizer, metrics) is ONE CUDA graph `g_step`; one instantiation per step regime (stats step, readout phase, ...); the host picks the graph from k | none |
 | 4 | Activations | remat=all when it fits; remat=min (elementwise recompute) next; remat=layer (levanter's per-layer recompute) only for the strict parity plans and variants that need it | planner rule §2.3 |
-| 5 | Attention | Vendored FlashAttention-3 (hopper/, commit `767386d`); the backward never runs FA3's padded non-persistent varlen grid: either a varlen persistent backward scheduler or a doc-causal patch (batch = rows) | E1b on H100 (§3.4, O1) |
-| 6 | Linear CE | Custom fused CE, persistent warp-specialized kernels; f32 logits never exist; stages B1 / B1.5 / B2 chosen per D; logits store dtype bf16 or f32 = what T1.0(2) shows | E2 + micro-bench (O2), T1.0(2) |
+| 5 | Attention | Vendored FlashAttention-3 (hopper/, commit `767386d`); the backward never runs FA3's padded non-persistent varlen grid: either a varlen persistent backward scheduler or a doc-causal patch (batch = rows). E1: FA3 is the fastest kernel at every shape; cuDNN THD is 9-32% slower | E1b on H100 (§3.4, O1) |
+| 6 | Linear CE | Custom fused CE, persistent warp-specialized kernels; f32 logits never exist; gradient in the forward; stages B1 / B1.5 / B2 chosen per D; logits store bf16 (T1.0 item 2) | E2 + micro-bench (O2); T1.5 (f32 store if it fails) |
 | 7 | GEMMs | cuBLASLt plus custom CUTLASS kernels; timed search per shape at plan time over deterministic algorithms only (split-K with non-atomic reduction and stream-K with deterministic fixup allowed); fused epilogues in stage 1 | per-shape timing |
 | 8 | Numerics | `exec.policy` bf16 or f32 (f32 for parity tests only); `exec.rounding` levanter or accurate; a `levanter_strict` preset reverts every class-P deviation; FMA contraction decided per formula | numerics.md §1 rule |
-| 9 | Optimizer | MuonH, AdamH, Adam fully on device; optimizer groups are data (`GroupSpec`); clip groups split so each starts when its buckets are reduced; schedules from a levanter fixture | T1.0 decides NS precision |
+| 9 | Optimizer | MuonH, AdamH, Adam fully on device; optimizer groups are data (`GroupSpec`); clip groups split so each starts when its buckets are reduced; schedules from a levanter fixture; Newton-Schulz in TF32 (T1.0 item 5) | none (O3 decided) |
 | 10 | Parallelism | DDP compute + ZeRO-1 state for every group: whole-matrix owners for MuonH, row shards for vocab-sized tensors; reduce to owners, bf16 all-gather at the start of the next step | §6 |
 | 11 | Data | One-time Python conversion to a flat uint32 token file; C++ mmap reader with a 256-step pageable ring and 16-32 reader threads; order = pure function of (plan, step) | none |
-| 12 | Checkpoint | Raw binary + JSON manifest, owner slices, async D2H, atomic rename, save on SIGTERM if it fits the 60 s budget; import from levanter checkpoints | measured write bandwidth |
+| 12 | Checkpoint | Raw binary + JSON manifest, owner slices, async D2H, atomic rename, buffered writes with 4 threads per rank, save on SIGTERM (E11: 3.3 s for the pls d48 state); import from levanter checkpoints | the runtime guard of §1.5 |
 | 13 | Metrics | Device ring, cross-rank sums inside the graph, host copies every 32 steps, local `metrics.jsonl` is the record, W&B mirror is a Python sidecar | none |
 | 14 | Config | One `Config` from `knobs.def`; valid names come from the registries; run id = hash of the non-default hashed knobs + the knob-table version | none |
-| 15 | Determinism | On by default | flips off if it costs > 3% of a step (O5) |
+| 15 | Determinism | On by default (predicted cost 0.3-2.4% of a step, §11) | flips off if it costs > 3% of a step (O5) |
 | 16 | Tests | f64/PyTorch references for baseline kernels, the existing JAX code for variants, whole-model gates V1-V4, sanitizer and poison modes; portable kernels also build for sm_80/86 so tests run on vis nodes | none |
 | 17 | Build | CMake, sm_90a (plus sm_80/86 for the test library), CUDA 12.8 | O8 |
 
-Expected step times against the levanter H100 reference (4 GPUs, §12): 130m 0.188 s vs 0.632 s (3.4x), 300m 0.378 s vs
-1.444 s (3.8x), 520m 1.63 s vs 6.74 s (4.1x), 1.2B 3.07 s vs 8.22 s (2.7x), pls d48 6.57 s vs 15.2 s (2.3x; 5.97 s
-with CE B1.5, 5.36 s with B2). These are budgets from stated efficiency assumptions; the H100 benches replace the
-assumptions as they land.
+Expected step times against the levanter H100 reference (4 GPUs, CE B1, determinism on; §12.2b, measured H100 GEMM
+and FA3 efficiencies): 130m 0.159 s vs 0.632 s (4.0x), 300m 0.344 s vs 1.444 s (4.2x), 520m 1.58 s vs 6.74 s (4.3x),
+1.2B 3.27 s vs 8.22 s (2.5x), pls d48 5.26 s vs 15.2 s (2.9x; 4.65 s with CE B1.5, 4.35 s with B2). The strongest
+measured baseline is a PyTorch step with FA3, a fused CE and `torch.compile` (E6): 0.426 s at 300m and 6.37 s at pls
+d48. The B1 budgets beat it by 1.24x and 1.21x. They stay estimates until marin.cpp's own kernels and steps are timed
+(S4, S5, S11).
 
 ## 1. Process and device model
 
@@ -118,8 +122,11 @@ wq hosts stop guests with TERM and kill them 60 s later. Timeline:
 6. Flush and fsync `metrics.jsonl` and `events.jsonl`, append a `stop` event.
 7. Exit 143. wq requeues the job (99, 124 and 143 requeue).
 
-Sizes: 130m checkpoint 1.76 GB, pls d48 40.1 GB (§7.2). At 1.65-2.7 GiB/s host staging the pls save takes 14-23 s if
-GPFS sustains it with 4 writers; E11 measures it. Step 4 makes the path safe for any measured rate.
+Sizes: 130m checkpoint 1.76 GB, pls d48 40.1 GB (§7.2). E11 (4 H100, one node, scratch GPFS) measured TERM to durable
+at 3.3 s for a 37.25 GiB state (4 ranks, pinned shards, buffered writes with 4 threads per rank, 14.5 GiB/s per node)
+and 18.1 s (max 20.7 s) for 260 GiB streamed through a 16 x 64 MiB pinned ring. O_DIRECT is 2.7x slower. So every
+stage-1 size saves on TERM: the writer is buffered with 4 threads per rank (O10). The drain of step 3 is not measured
+for a real step (estimate 13 s at pls d48); S10's TERM test measures it. Step 4 stays as the guard.
 
 ## 2. Memory
 
@@ -311,7 +318,8 @@ Three independent axes (core.hpp `Numerics`):
 | gradient reduction dtype | f32 | bf16 | `exec.grad_reduce` |
 | embedding backward accumulator | f32 sorted segment sum | bf16 running accumulator in ascending position order (sorted, deterministic) | `exec.embed_accum` |
 | CE head dW | f32 accumulation across chunks and microbatches | bf16 per 8,192-row chunk, f32 sum, bf16 per microbatch | `exec.ce_dw_round`, `exec.ce_chunk_rows=8192` |
-| CE logits store | what T1.0(2) shows (bf16 or f32) | same | `exec.ce_logits` |
+| CE logits store | bf16 (T1.0 item 2: levanter's backward recomputes the logits with a bf16 output) | same | `exec.ce_logits` (`auto` = bf16; `f32` only if T1.5 fails) |
+| norm-gain gradient reduction | f32 per-CTA partials, fixed order | bf16 summands and bf16 accumulator in two stages (T1.0 item 4, H100) | `exec.rounding` |
 | microbatching at 520m / 1.2B | 8 x 8 sequences per GPU, remat=all | 2 x 32, remat=layer | `exec.micro_seqs`, `exec.remat` |
 
    With bf16 per-microbatch parameter gradients, 8 microbatches round 8 times where levanter rounds twice; the strict
@@ -388,7 +396,11 @@ the bf16 rounding of levanter's per-microbatch gradient costs no transient and n
   `a = bf16(g_bf16·dy)`, `dx = bf16(a32·r + c·2·x32)` with `c = (s·(-0.5·(r/(ms+eps))))/n`, in that operation order and
   with the contraction of §3.0.
 - Gain gradients: per-CTA f32 partials, then `k_reduce_rows` in fixed order; under `levanter` the per-microbatch result
-  is rounded to bf16 before it is added to the f32 gradient.
+  is rounded to bf16 before it is added to the f32 gradient. T1.0 item 4 (H100 HLO, 2026-10-25) shows more: levanter
+  sums bf16 summands into a bf16 accumulator in two stages (block and final norms: partials over 512 positions, then
+  over the partials; q/k norms: over 1024 rows, then over the partials); the A100 HLO had an f32 accumulator. The
+  `levanter` gain reduction copies the H100 form (S3 owner, open item). T1.2 `dg` uses the oracle rule (levanter's own
+  `dg` error is 6.5e-3 to 8.8e-3), so the f32 form passes it.
 - QK-norm per (token, head) over hd with one gain per layer shared by all heads, before RoPE (model.md §2.1).
 - The residual stream stays bf16 (class P; an f32 residual is an A/B candidate, not stage 1).
 
@@ -435,8 +447,20 @@ be zeroed every call. Version 2 never runs that grid in training. Two fixed sche
   version-1 grid, `persistent` and `doc_causal`, each with deterministic on and off, at the 130m, 520m and 1.2B shapes.
   Default = the faster of `persistent` and `doc_causal` summed over the shapes; ties within 3% go to `doc_causal` (no
   padding buffers). cuDNN replaces FA3 only if it beats the chosen FA3 path by more than 5% and passes T1.4. The E1
-  results already queued (real `cu_seqlens`, `max_seqlen` = the real maximum, deterministic off) do not represent the
+  results (real `cu_seqlens`, `max_seqlen` = the real maximum, deterministic off) do not represent the
   trainer and do not decide D1 alone.
+- What E1 and E6 settle (H100, 2026-10-25; `docs/bench/RESULTS.md` §1):
+  - FA3 varlen with the real `cu_seqlens` is the fastest kernel at every shape: fwd+bwd per layer per 32 x 4096 tokens
+    2.51 ms (130m), 3.75 ms (300m), 5.68 ms (520m), 9.21 ms (1.2B). Summed over 130m, 520m and 1.2B: FA3 17.40 ms,
+    FA4 CuTe 17.43 ms, cuDNN THD 19.58 ms. FA4 is a tie (no switch below 5%); cuDNN is 12.5% slower.
+  - The padded `cu_seqlens` a graph needs (version-1 style) cost FA3 fwd+bwd +25% (300m) and +33% (d48) (E6). This
+    confirms that the trainer never runs the padded grid.
+  - These E1 times are the bar for S4: each fixed scheduler must be no slower than E1's FA3 at each shape with
+    deterministic off. cuDNN can win O1 only if the chosen FA3 path sums to more than 20.56 ms over the three
+    shapes (19.58 ms x 1.05), that is 18% slower than E1's FA3. So S4 builds no C++ `CudnnSdpa` backend unless E1b
+    shows that; E1b times cuDNN through the existing Python bench.
+  - The deterministic FA3 varlen backward costs 1.14x fwd+bwd in isolation (E8c) and nothing measurable in a 300m
+    PyTorch step (0.560 vs 0.562 s, E6). §11 uses the 1.14x.
 
 Scale: under `levanter`, the QKV epilogue multiplies q by the bf16 scale in bf16 and FA3 gets `softmax_scale = 1`; the
 dq postprocess multiplies dq by the scale in bf16 (numerics.md §3.4). Under `accurate`, FA3 gets the bf16 scale, so
@@ -479,6 +503,12 @@ postprocess, and `k_sandwich_tail_*` (or the D = 512 o_proj/down epilogue). Pre-
   (130m: [1536,512], [512,512], [3584,512], [512,1792] = 24, 8, 56, 28 tiles of 128 x 256 on 132 SMs). Without split-K
   or stream-K each is one partial wave: 18-34 ms per step at 130m instead of about 10 ms. The `e1/gemm.py` wgrad sweep
   at M = 131,072 supplies the data.
+- What E1 measured (1 H100, bf16, M = 131,072): cuBLAS default heuristics give fwd 557-711, dgrad 651-760, wgrad
+  641-728 TFLOP/s; XLA gives 571-760. So the weight-gradient GEMMs do not lose partial waves at these shapes (perf-2's
+  risk is not seen), but the cuBLAS default is 5-17% behind XLA on the forward at K = 1024 and at the vocab shapes. The
+  search is therefore required, and its bar per shape is the best of cuBLAS and XLA in E1 (`docs/bench/RESULTS.md`
+  §2). Mean efficiency of the trunk shapes (best per orientation): 0.693 (D = 512), 0.721 (768), 0.753 (1024), 0.730
+  (2048) of 989.5 TFLOP/s.
 - Custom CUTLASS kernels are first-class: every epilogue fusion of §3.1, the levanter wgrad epilogue, and K = 512
   projections where they beat cuBLASLt. A custom kernel takes a shape when it is the fastest deterministic candidate.
 - Newton-Schulz GEMMs (§4.2): TF32, true f32 (FFMA), or 3xTF32 split precision (f32-level error at about twice the
@@ -525,10 +555,19 @@ to a multiple of 128 (any `model.seq_len` resolves to a valid chunk). An explici
 the planner's fit test uses while it chooses `micro_seqs`.
 
 Logits store dtype (parity review 3): T1.0 item 2 reads whether XLA keeps the bf16 output of levanter's backward logit
-dot. `exec.ce_logits=auto` resolves to that fact (bf16 if kept, f32 if XLA folded the convert into an f32 GEMM output);
-until T1.0 has run, `auto` refuses to resolve in parity runs. The f32 store doubles the chunk buffer (+2.1 GB at 8,192
-rows; every plan still fits, §2.5). A recompute variant (forward keeps only statistics; dgrad and wgrad recompute z in
-f32 for +2DV FLOPs) is the fallback if the f32 store is slower than the recompute.
+dot. `exec.ce_logits=auto` resolves to that fact (bf16 if kept, f32 if XLA folded the convert into an f32 GEMM output).
+Fact (H100, 2026-10-25): kept. Levanter's `batched_xla` forward computes f32 logits for the lse; its backward recomputes
+the logits as `bf16[8192, 128256]` and forms `p = exp(z - lse)` from them. So `auto` = bf16, the store of this section.
+The f32 store (+2.1 GB at 8,192 rows) stays as `exec.ce_logits=f32`, used only if the bf16 store fails T1.5. The
+recompute variant is dropped: E2 measured recompute +15-31% at every shape with V >= 8,256, and the f32 store beat the
+f32 recompute by 13% (25.48 vs 29.26 ms at the pls head shape).
+
+E2 bars (1 H100, `docs/bench/RESULTS.md` §3). Liger's fused linear CE with f32 dW accumulation and a chunk of 8,192-16,384
+rows has B1's structure (logits GEMM with bf16 output, an in-place row kernel, dgrad and wgrad GEMMs) and is the
+fastest measured candidate: 13.57 ms per pls head (16,384 x 512 x 128,256), 109.0 / 145.2 / 179.3 / 320.0 ms at
+131,072 rows and D = 512 / 768 / 1024 / 2048. B1 must be no slower than these times at each shape. With the best E1
+GEMMs (9.14 ms per pls head) and Liger's measured non-GEMM time (3.65 ms) B1 projects to 12.8 ms per pls head; B2
+projects to 9.1-10.7 ms. Levanter's `batched_xla` takes 27.12 ms per pls head.
 
 The gradient is computed in the forward pass; g = `weight[t] / (B_global x (S-1))` in f32 (the global token mean), so
 the math does not depend on the microbatch split; only the summation order of dW does.
@@ -592,6 +631,12 @@ All of it runs on device inside `g_step` and reads k from device memory (`optim_
 Precision (O3, T1.0 item 5): `optim.ns_precision=auto` resolves to TF32 if levanter ran TF32, else to f32. For f32 the
 implementation is 3xTF32 with upper-triangle products unless T1.6 shows it outside `rel <= 1e-5`, in which case true
 FFMA f32 is used. Budget at 1.2B with ownership over 4 ranks: TF32 43 ms, true f32 214 ms, 3xTF32 75 ms.
+Fact (H100, 2026-10-25): levanter ran TF32. All 105 Newton-Schulz dots are f32 x f32 at DEFAULT precision (90 Triton
+fusions, 15 cuBLASLt); at run time DEFAULT equals `tensorfloat32` bitwise on 7 of 7 matrices (130m and 1.2B), and
+f32 GEMM probes fingerprint TF32 with round-to-nearest operands (rel to the f64 product of TF32-RNE-rounded operands
+1.2e-6 to 8.5e-6, against 2.9e-4 for f32 operands and 8.7e-4 for truncated ones). So `auto` = TF32 (O3 decided). The
+TF32 kernels round operands to nearest, as XLA's do (a truncating conversion fails the probe of T1.6). T1.6 and T1.7
+use the oracle rule with levanter at HIGHEST as the oracle. 3xTF32 and true f32 stay for the f32 policy and A/B tests.
 
 Distribution: NS always runs on the owner of each whole matrix (ZeRO-1, §6), so version 1's "distribute if > 1%" rule
 is gone. Owners are assigned by LPT on NS cost plus elementwise bytes.
@@ -721,8 +766,10 @@ and repack.
 
 ### 6.2 Reduction dtype
 
-Levanter's cross-GPU reductions were most likely bf16 (numerics.md §6.2, open until T1.0). marincpp reduces in f32 by
-default (`exec.grad_reduce=f32`, class P upward); `bf16` (convert, reduce, convert back) is the strict-preset value.
+Levanter's cross-GPU gradient reductions are bf16 (T1.0 item 1, H100 HLO: every gradient reduce-scatter and the gain
+all-reduce add in bf16; the f32 all-reduces are Newton-Schulz partial sums, norms and the loss). marincpp reduces in
+f32 by default (`exec.grad_reduce=f32`, class P upward, O7); `bf16` (convert, reduce, convert back) is the
+strict-preset value.
 
 ### 6.3 Metrics reduction
 
@@ -991,6 +1038,15 @@ Cost: the FA3 deterministic backward is the only known cost (serialized accumula
 and 520m for 50 steps; if the cost exceeds 3% of the step, the default flips to off and a determinism smoke stays in
 CI. Benefit: n = 1 A/B tests of single class-P items, bitwise resume.
 
+Measured (H100, 2026-10-25, E8 and E6): the deterministic FA3 varlen fwd+bwd takes 1.14x the default in isolation;
+inside a 300m PyTorch step it costs nothing measurable (0.560 vs 0.562 s). Whole-stack costs do not transfer:
+levanter with `--xla_gpu_deterministic_ops` is +26% and a PyTorch eager step with `use_deterministic_algorithms` is
++5%, both from atomics-based ops that marincpp replaces by design (PyTorch's deterministic `index_add_` is 14-17x slower;
+the sorted embedding sum is not). Applying 1.14x to the FA3 rows of §12.2b predicts 1.3% (130m), 1.8% (300m), 2.4%
+(520m), 1.3% (1.2B) and 0.3% (pls d48) of the step. So the default stays on; the 50-step S11 measurement decides. In
+both measured stacks the deterministic twins are bitwise equal at every logged step (levanter 28 steps, PyTorch 30
+steps), and the default twins first differ at step 2.
+
 ## 12. Performance budget
 
 ### 12.1 Assumptions
@@ -1002,6 +1058,15 @@ assuming the GEMM search of §3.7 removes partial waves and the CE kernels meet 
 at 0.5 of peak. Attention FLOPs use the measured computed/causal ratio 0.504. Elementwise bytes per layer per token,
 fused stage 1: 40D + 16F + 10(H+KV)hd minus the fusions of §3.1 (-8F, -6(H+KV)hd, -2H·hd, -4D at D = 512), plus FA3's
 backward side traffic 12·H·hd (accumulator clear, f32 dq accumulation, postprocess; the preprocess is folded).
+
+Version 3 (`python3 scripts/design_budget.py --measured`, 2026-10-25) replaces three of these with H100 measurements
+(`docs/bench/RESULTS.md`): GEMMs at the E1 efficiency of each D (trunk 0.693 / 0.721 / 0.753 / 0.730 at D = 512 / 768 /
+1024 / 2048; CE GEMMs 0.714 at 16,384 rows and 0.691 at 131,072 rows for D = 512, 0.707 for D = 768); attention at
+E1's FA3 varlen times per layer, plus the deterministic extra of E8 (x1.14 of fwd+bwd); CE traffic counts only the
+bytes no GEMM hides, because the measured GEMM times include their output writes: B1 4V (the row kernel reads and
+rewrites the store), B1.5 2V (dz write), B2 1V (half of E2's 0-2V range for the store write and the exp work the
+transform warpgroup may not hide). Elementwise, optimizer, Newton-Schulz and communication rows keep the version-2
+estimates. The C++ `step_budget` and the CE chunk rule still use version 2 (§12.2); the chunk choices are the same.
 
 ### 12.2 Budget per step (ms, per GPU, 4 GPUs, reference global batch, CE B1 unless noted)
 
@@ -1039,6 +1104,47 @@ Notes:
   fixes are stage 1 (S4).
 - pls d48 is CE-bound: B1's memory term is 28% of its step, so pls needs B1.5 or B2 in stage 1 (O2 decides).
 - Run wall clock, 130m: 4,959 x 0.188 s = 931 s of steps + 32 s of evals + ~30 s start = ~17 min (levanter 57 min).
+
+### 12.2b Budget per step with measured H100 efficiencies (version 3, the budget of record)
+
+Same plans and units as §12.2, CE B1 unless noted, determinism on. Rows with a measured basis are marked (E1, E8).
+
+| op | 130m | 300m | 520m | 1.2B | pls d48 (opt. B) |
+|---|---|---|---|---|---|
+| trunk GEMMs (E1 efficiency) | 26.2 | 113.2 | 717.6 | 1973.6 | 209.3 |
+| attention fwd (E1 FA3) | 4.0 | 11.4 | 61.0 | 55.4 | 31.7 |
+| attention bwd (E1 FA3) | 11.1 | 33.6 | 211.7 | 239.4 | 88.8 |
+| attention deterministic extra (E8, x1.14) | 2.1 | 6.3 | 38.2 | 41.3 | 16.9 |
+| LM head + CE GEMMs (E1 efficiency) | 75.5 | 110.7 | 277.4 | 572.2 | 3507.8 (48 heads) |
+| CE exposed traffic (B1 4V, B1.5 2V, B2 1V B/token) | 25.1 | 25.1 | 50.2 | 50.2 | 1204.4 |
+| CE head-gradient read-modify-write | 0.8 | 1.2 | 6.3 | 12.5 | 75.3 |
+| norms, RoPE, SwiGLU, residual, FA3 side traffic (fused) | 12.3 | 38.8 | 201.9 | 269.2 | 98.6 |
+| embedding fwd + sorted bwd | 0.2 | 0.3 | 0.8 | 1.6 | 0.2 |
+| optimizer elementwise (owner shards) | 0.6 | 1.2 | 2.4 | 5.7 | 17.4 |
+| Newton-Schulz (TF32, owners) | 0.3 | 2.0 | 8.1 | 43.4 | 2.3 |
+| exposed communication | 0.5 | 0.4 | 0.8 | 1.8 | 4.4 |
+| **step (B1)** | **158.6** | **344.0** | **1576.3** | **3266.4** | **5256.9** |
+| step (B1.5) | 146.1 | 331.5 | 1551.2 | 3241.3 | 4654.8 |
+| step (B2) | 139.8 | 325.2 | 1538.7 | 3228.7 | 4353.7 |
+| step, unfused elementwise (B1) | 165.8 | 363.9 | 1674.9 | 3397.8 | 5314.6 |
+| version-2 step (B1), §12.2 | 187.7 | 378.3 | 1626.8 | 3069.7 | 6567.2 |
+| tokens/s (B1) | 3,305,000 | 1,524,000 | 665,200 | 321,000 | 99,700 |
+| levanter H100 tokens/s (measured) | 830,158 | 363,155 | 155,541 | 127,550 | 34,500 |
+| speedup over levanter (B1 / B2) | 4.0 / 4.5 | 4.2 / 4.4 | 4.3 / 4.4 | 2.5 / 2.5 | 2.9 / 3.5 |
+| PyTorch compile step, E6 (s) | | 0.426 | | | 6.370 |
+| speedup over PyTorch compile (B1 / B2) | | 1.24 / 1.31 | | | 1.21 / 1.46 |
+| levanter-formula MFU (B1) | 57% | 64% | 68% | 70% | 54% |
+| levanter_strict step (B1) | — | — | 1891.3 | 3999.9 | — |
+
+Notes:
+- Against version 2: GEMMs at D <= 1024 are 5-16% faster than assumed and at D = 2048 6% slower, so 1.2B rises from
+  3.07 to 3.27 s; FA3 beats the assumed efficiency except the hd-128 backward (1.2B); the CE store write sits inside
+  the measured GEMM time. pls option A (micro 4, remat=min): 5.55 s (B1).
+- The anchor is the PyTorch step of E6, not levanter: it already runs 3.4x (300m) and 2.4x (pls d48) faster than
+  levanter. At 300m the CE of E6 (151.8 ms) is close to this budget's CE rows (137.0 ms), so the gain over PyTorch
+  must come from the trunk: E6 spends 274 ms outside the CE against 207 ms here.
+- pls d48 is CE-bound: the CE rows are 91% of the B1 step. B2 saves 0.90 s per step (17%).
+- The FA3 rows assume that the fixed backward scheduler of O1 is no slower than E1's FA3 (the S4 bar).
 
 ### 12.3 Profiling method
 
@@ -1120,9 +1226,9 @@ and 8,900 of Python.
 | S1 | converter (Python) + TokenFile, threefry, LevanterOrder, DataPlan, prefetch ring and pinned slots | T0.1, T0.2, T0.3, T0.4, T0.5 |
 | S2 | schedule fixture (`tests/s2/schedule_fixture.py`) + loader + formula cross-check (`src/sched`) | T0.7 (all four sizes, every k) |
 | S3 | unfused elementwise kernels, bf16 and f32 forms, + C ABI + references; FMA policy | per-kernel gradient checks (per-row report); T1.2 (RMSNorm), T1.3 (RoPE tables bitwise) |
-| S4 | GemmCache timed search with deterministic split-K/stream-K and the levanter wgrad epilogue; FA3 entry points with both fixed backward schedulers, glue as arena buffers; LevRef, RefF32; cuDNN | GEMM checks; T1.4 (all backends, 130m/520m/1.2B shapes); E1b decision (O1) |
-| S5 | CE A (bf16 and f32), B1 (bf16 and f32 store), B1.5, B2; readouts with `dx = nullptr` | T1.5 at D = 512/768/1024/2048; E2 decision per D (O2) |
-| S6 | T1.0 read (precision facts); optimizer kernels with GroupSpec, RowPartition, owner plan; NS TF32/f32/3xTF32 | T1.6, T1.7 cases A, B, C; row-partition gate |
+| S4 | GemmCache timed search with deterministic split-K/stream-K and the levanter wgrad epilogue; FA3 entry points with both fixed backward schedulers, glue as arena buffers; LevRef, RefF32; cuDNN only if E1b requires it (§3.4) | GEMM checks against the E1 bars; T1.4 (all built backends, 130m/520m/1.2B shapes); E1b decision (O1); 4-GPU graph capture of FA3 + NCCL |
+| S5 | CE A (bf16 and f32), B1 (bf16 store; f32 store as the T1.5 fallback), B1.5, B2; readouts with `dx = nullptr` | T1.5 at D = 512/768/1024/2048; B1 no slower than the E2 Liger bars; stage per D (O2) |
+| S6 | optimizer kernels with GroupSpec, RowPartition, owner plan; NS TF32 (the T1.0 fact) and f32/3xTF32 | T1.6, T1.7 cases A, B, C; row-partition gate |
 | S7 | Model (baseline block), init (fixture, then the threefry + XLA erf/erf_inv port), f32 policy eager; then DDP + ZeRO-1 reduce-to-owner, metrics reduction, single-graph capture, regimes, capture lint; canary/poison/sanitizer | T2.2, T2.4 (f32 policy); T2.1, T2.5, T2.6, T2.7 at 130m and 300m on 1 and 4 GPUs; T1.1 (init bitwise); 1-vs-4-GPU loss; V3; eager == graph at k0, k0+1, boundaries |
 | S8 | stage-1 fusions: QK-norm/RoPE in the QKV epilogue, dq postprocess fusion, preprocess in the o_proj dgrad epilogue, SwiGLU epilogues, D = 512 sandwich-tail epilogues | each fused output equals the unfused path bitwise (levanter mode); `--profile-ops` rows within 1.25x |
 | S9 | eval (sources, groupings, f64 per-batch sums, key formulas) and metrics (logging contract), JSONL, W&B sidecar | T3.1 (i) and (ii), T3.3; init eval under `eval_init/` |
@@ -1203,19 +1309,40 @@ No point was rejected whole. Three parts were rejected or changed: perf-1(b) and
 consumer once the fixed schedulers exist), and par-5's device kernel for RunningMean (host thread with explicit FMA
 instead).
 
+### Part B. H100 measurements (2026-10-25)
+
+Source: devq runner on one 8-GPU H100 node, tasks t1-t31 (E1, E2, E6, E7, E8, E11, the T1/T2 levanter fixtures);
+summary `docs/bench/RESULTS.md`. E3 (levanter profile) is still in analysis; nothing below depends on it.
+
+| point | verdict | what changed / why |
+|---|---|---|
+| h100-1 O3 NS precision | decided: TF32 | T1.0 item 5: all 105 NS dots run at DEFAULT precision; NS output equals `tensorfloat32` bitwise on 7/7 matrices; TF32-RNE fingerprint. §4.2, §0 row 9 |
+| h100-2 O4 store and strict dtypes | decided | T1.0 items 1-4: `exec.ce_logits=auto` = bf16; strict `grad_reduce=bf16` and `embed_accum=bf16_seq` confirmed; levanter's gain reduction is bf16 two-stage on H100 (new §3.0 row, §3.3; S3 owner). §3.8, §6.2 |
+| h100-3 O2 CE | narrowed | gradient in the forward, bf16 store, f32 dW; recompute variant dropped (E2: +15-31%); Liger f32-dW times are B1's bar per shape. Stage per D waits for the S5 kernels. §3.8 |
+| h100-4 O1 attention | narrowed | E1: FA3 fastest (FA4 tie, cuDNN THD +12.5% summed); E6: padded `cu_seqlens` +25-33%. E1 times are S4's bar; no C++ cuDNN backend unless E1b's FA3 sum exceeds 20.56 ms. §3.4 |
+| h100-5 O5 determinism | default stays on (prediction) | E8: FA3 det x1.14 in isolation, 0 in a 300m step; predicted 0.3-2.4% of the marincpp step (§11). S11's 50-step run decides |
+| h100-6 O9 GEMMs | rule confirmed | E1: cuBLAS default 5-17% behind XLA on some forward shapes; wgrad shows no partial-wave loss. Bar per shape = best of cuBLAS and XLA (§3.7) |
+| h100-7 O10 SIGTERM save | decided: always save, buffered/4 threads | E11: 3.3 s (37.25 GiB), 18.1 s (260 GiB); O_DIRECT 2.7x slower. §1.5, §0 row 12 |
+| h100-8 O8 CUDA version | narrowed | levanter ran the CUDA 13 XLA plugin (cuBLAS 13); S4 times cuBLASLt 12.8 vs 13.0 at the E1 shapes |
+| h100-9 budget | applied | §12.2b version 3 with measured GEMM and FA3 efficiencies; anchor = PyTorch compile (E6) |
+| h100-10 graph capture | new S4 check | E6: every PyTorch CUDA-graph arm with 4-rank NCCL and FA3 on H100 crashed (SIGSEGV near capture; passes on 1 A100). S4 adds a 4-GPU capture smoke of FA3 fwd+bwd + NCCL in one graph before S7 relies on decision 3 |
+
 ## Open decisions (H100 measurements only)
 
-| id | decision | measurement | rule |
-|---|---|---|---|
-| O1 | FA3 backward scheduler (`persistent` vs `doc_causal`), and FA3 vs cuDNN | E1b: real segment rows at 130m/520m/1.2B shapes; padded version-1 grid, `persistent`, `doc_causal`, cuDNN; deterministic on and off; fwd + bwd time | faster of the two FA3 schedulers summed over shapes; ties within 3% -> `doc_causal`; cuDNN only if > 5% faster than that and passes T1.4 |
-| O2 | CE stage per D (B1, B1.5, B2) and the f32-store vs recompute variant | E2 + `bench/ce_micro` at T = 16,384 and 131,072, D = 512/768/1024/2048, V = 128,256, with the T1.0(2) store dtype | fastest passing T1.5 per D; f32 store unless recompute is faster |
-| O3 | Newton-Schulz precision | T1.0 item 5 (optimized HLO of a levanter H100 step); T1.6 | TF32 if levanter ran TF32; else 3xTF32 if T1.6 holds rel <= 1e-5, else true f32 |
-| O4 | CE logits store dtype; gradient reduction dtype; embedding and gain accumulator dtypes | T1.0 items 1-4 | `exec.ce_logits` = the fact; strict-preset values = the facts; fast defaults stay f32 unless the n >= 4 A/B fails |
-| O5 | determinism default | 50 steps on/off at 130m and 520m | off only if > 3% of the step |
-| O6 | pls d48 option A or B | 20-step timing of both | faster wins |
-| O7 | each fast-default class-P deviation (FA3 statistics, f32 reduce, f32 embedding sum, f32 head dW, 8 x 8 microbatching) | T4 at 300m fast vs strict; T5.2 seeds 0-3 against the pool | keep fast if T5.2 passes; else bisect item by item with the strict preset |
-| O8 | CUDA 12.8 or 13.x | T1 and step time on both | 12.8 unless 13.x is faster by > 3% |
-| O9 | GEMM per shape (cuBLASLt split-K, CUTLASS stream-K, custom) | plan-time timed search on the job's GPU | fastest deterministic candidate; ties to cuBLASLt |
-| O10 | checkpoint on SIGTERM | E11 write bandwidth with 4 writers from pinned staging | save if `elapsed + bytes/bandwidth < 50 s` |
-| O11 | programmatic dependent launch | nsys GPU idle between kernels | apply if idle > 2% of the step |
-| O12 | pls eval microbatch and graph grouping | eval timing at d48 with 48 readouts | largest eval microbatch that fits; group size that minimizes eval time |
+Status 2026-10-25 after the first H100 benches (`docs/bench/RESULTS.md`, Appendix A part B). "Decided" rows keep their
+rule as the record; "open" rows name the measurement still missing.
+
+| id | decision | status | data so far | still missing | rule |
+|---|---|---|---|---|---|
+| O1 | FA3 backward scheduler (`persistent` vs `doc_causal`), and FA3 vs cuDNN | open, narrowed | E1: FA3 varlen fastest (fwd+bwd 2.51 / 5.68 / 9.21 ms at 130m / 520m / 1.2B; FA4 tie; cuDNN THD +12.5% summed); E6: padded `cu_seqlens` +25-33% | E1b: both fixed schedulers (vendored `767386d`), deterministic on and off, on the real segment rows | faster FA3 scheduler summed over shapes, ties within 3% -> `doc_causal`; each no slower than E1's FA3; cuDNN only if > 5% faster than that (needs the FA3 sum > 20.56 ms) and passes T1.4 |
+| O2 | CE stage per D (B1, B1.5, B2); store dtype; recompute variant | open for the stage; store and recompute decided | T1.0(2): store bf16; E2: recompute +15-31%, dropped; Liger f32-dW times per shape (13.57 ms per pls head) | S5 `ce_micro`: B1, B1.5, B2 at T = 16,384 and 131,072, D = 512/768/1024/2048; T1.5 with the bf16 store | fastest passing T1.5 per D; B1 no slower than Liger at each E2 shape; f32 store only if the bf16 store fails T1.5 |
+| O3 | Newton-Schulz precision | decided: TF32 | T1.0(5): levanter NS = TF32 (RNE operands) on H100 | T1.6 of the marincpp kernels (oracle rule) | TF32 if levanter ran TF32 |
+| O4 | CE logits store; strict reduction, embedding and gain dtypes | decided | T1.0(1-4): store bf16; gradient reductions bf16; embedding scatter bf16 (atomic, unordered); gain reductions bf16 two-stage | none for the facts; the fast defaults go to O7 | `exec.ce_logits` = the fact; strict values = the facts; fast defaults stay f32 unless the n >= 4 A/B fails |
+| O5 | determinism default | open; default on | E8: FA3 det x1.14 in isolation, 0 in a 300m PyTorch step; predicted 0.3-2.4% of the marincpp step | 50 steps on/off at 130m and 520m (S11) | off only if > 3% of the step |
+| O6 | pls d48 option A or B | open | budget §12.2b: A 5.55 s, B 5.26 s (B1) | 20-step timing of both (S12) | faster wins |
+| O7 | each fast-default class-P deviation | open | T1.0: levanter's embedding gradient (bf16 atomics) loses about a quarter of its norm against f32 | T4 at 300m fast vs strict; T5.2 seeds 0-3 | keep fast if T5.2 passes; else bisect with the strict preset |
+| O8 | CUDA 12.8 or 13.x | open, narrowed | levanter ran the CUDA 13 XLA plugin; FA3 compiles with 12.8 and 13.0 | S4: cuBLASLt 12.8 vs 13.0 at the E1 GEMM shapes; then T1 and step time on both | 12.8 unless 13.x is faster by > 3% |
+| O9 | GEMM per shape | rule confirmed; runs at plan time | E1: cuBLAS default 5-17% behind XLA on some forward shapes; wgrad 641-728 TFLOP/s (no partial-wave loss) | the GemmCache search itself (S4) | fastest deterministic candidate, ties to cuBLASLt; per shape at least the best of cuBLAS and XLA in E1 |
+| O10 | checkpoint on SIGTERM | decided: always save | E11: TERM to durable 3.3 s (37.25 GiB), 18.1 s (260 GiB); buffered/4 threads 14.5 GiB/s per node; O_DIRECT 2.7x slower | real-step drain time (S10 TERM test) | save if `elapsed + bytes/bandwidth < 50 s`; buffered writes, 4 threads per rank |
+| O11 | programmatic dependent launch | open | E6/E7: GPU idle 0.5-2.2% in compiled PyTorch and JAX steps (6.5% at d48 with 1 head) | nsys of the marincpp graph (S11) | apply if idle > 2% of the step |
+| O12 | pls eval microbatch and graph grouping | open | none | eval timing at d48 with 48 readouts (S12) | largest eval microbatch that fits; group size that minimizes eval time |

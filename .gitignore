@@ -6,3 +6,5 @@ build/
 logs/
 core.[0-9]*
 bench/
+wq-*.out
+.claude/

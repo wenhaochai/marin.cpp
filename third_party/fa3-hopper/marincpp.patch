@@ -1,0 +1,971 @@
+diff -ru a/block.h b/block.h
+--- a/block.h
++++ b/block.h
+@@ -16,7 +16,8 @@
+             int const m_block, int const bidb, int const split_idx, int const num_splits,
+             int const window_size_left, int const window_size_right,
+             cutlass::FastDivmod const& attention_chunk_divmod,
+-            cutlass::FastDivmod const& qhead_per_khead_divmod) {
++            cutlass::FastDivmod const& qhead_per_khead_divmod,
++            int const* doc_lo = nullptr) {  // marincpp doc-causal: segment start of every query of this batch row
+ 
+         int const seqlen_k = seqlen_info.seqlen_k;
+         int const seqlen_q = seqlen_info.seqlen_q;
+@@ -36,12 +37,16 @@
+         if constexpr (Is_local) {
+             int m_idx_min = m_block * kBlockM;
+             if (PackGQA) { m_idx_min = qhead_per_khead_divmod.divide(m_idx_min); }
+-            int const n_idx = m_idx_min + seqlen_k - seqlen_q;
+-            int n_idx_left = n_idx - window_size_left;
+-            if (attention_chunk_divmod.divisor > 0) {
+-                n_idx_left = std::max(n_idx_left, flash::round_down(attention_chunk_divmod, n_idx));
++            if (doc_lo != nullptr) {  // marincpp doc-causal: keys before the first query's segment are never visible
++                n_block_min = doc_lo[std::min(m_idx_min, seqlen_q - 1)] / kBlockN;
++            } else {
++                int const n_idx = m_idx_min + seqlen_k - seqlen_q;
++                int n_idx_left = n_idx - window_size_left;
++                if (attention_chunk_divmod.divisor > 0) {
++                    n_idx_left = std::max(n_idx_left, flash::round_down(attention_chunk_divmod, n_idx));
++                }
++                n_block_min = std::max(int(0), n_idx_left / kBlockN);
+             }
+-            n_block_min = std::max(int(0), n_idx_left / kBlockN);
+         }
+         // if (threadIdx.x == 128) { printf("Inside, bid.x = %d, bid.y = %d, bid.z = %d, split_idx = %d, n_block_min: %d, n_block_max: %d\n", blockIdx.x, blockIdx.y, blockIdx.z, split_idx, n_block_min, n_block_max); }
+         if constexpr (Split) {
+@@ -83,13 +88,17 @@
+     cute::tuple<int, int> get_m_block_min_max(
+             SeqlenInfo_t const& seqlen_info,
+             int const n_block, int const bidb,
+-            int const window_size_left, int const window_size_right, int const sink_token_length) {
++            int const window_size_left, int const window_size_right, int const sink_token_length,
++            int const* doc_hi = nullptr) {  // marincpp doc-causal: segment end of every key of this batch row
+         // TODO: support attention_chunk
+         int const seqlen_q = seqlen_info.seqlen_q;
+         int const seqlen_k = seqlen_info.seqlen_k;
+         int m_block_max = cute::ceil_div(seqlen_q, kBlockM);
+         if constexpr (Is_local) {
+-            if (n_block >= cute::ceil_div(sink_token_length, kBlockN)) {
++            if (doc_hi != nullptr) {  // queries at or after the last key's segment end see no key of this block
++                int const c_last = std::min((n_block + 1) * kBlockN, seqlen_k) - 1;
++                m_block_max = std::min(m_block_max, cute::ceil_div(doc_hi[c_last], kBlockM));
++            } else if (n_block >= cute::ceil_div(sink_token_length, kBlockN)) {
+                 m_block_max = std::min(m_block_max, cute::ceil_div((n_block + 1) * kBlockN + seqlen_q - seqlen_k + window_size_left, kBlockM));
+             }
+         }
+@@ -124,16 +133,28 @@
+             SeqlenInfo_t const& seqlen_info,
+             int const m_block, int const n_block_min, int const window_size_left,
+             cutlass::FastDivmod const& attention_chunk_divmod,
+-            cutlass::FastDivmod const& qhead_per_khead_divmod) {
++            cutlass::FastDivmod const& qhead_per_khead_divmod,
++            int const* doc_lo = nullptr) {
+         int const m_idx_max = !PackGQA ? (m_block + 1) * kBlockM : qhead_per_khead_divmod.divide((m_block + 1) * kBlockM - 1) + 1;
+         int const n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q;
+         int n_idx_left = !Is_local ? n_idx : n_idx - window_size_left;
+         if (Is_local && attention_chunk_divmod.divisor > 0) {
+             n_idx_left = std::max(n_idx_left, flash::round_down(attention_chunk_divmod, n_idx));
+         }
++        if (Is_local && doc_lo != nullptr) {  // marincpp doc-causal: blocks at or after the last query's segment start
++            return std::max(n_block_min, cute::ceil_div(doc_lo[std::min(m_idx_max, seqlen_info.seqlen_q) - 1], kBlockN));
++        }
+         return !Is_local ? n_block_min : std::max(n_block_min, cute::ceil_div(n_idx_left, kBlockN));
+     }
+ 
++    // marincpp doc-causal backward: m blocks below this one see every key of block n_block that causality allows
++    // (all their rows lie before the segment end of the block's first key).
++    static
++    CUTLASS_DEVICE
++    int get_m_block_max_before_doc_mask(int const n_block, int const m_block_max, int const* doc_hi) {
++        return std::min(m_block_max, doc_hi[n_block * kBlockN] / kBlockM);
++    }
++
+ };
+ 
+ } // namespace flash
+diff -ru a/copy_sm90_bulk_reduce.hpp b/copy_sm90_bulk_reduce.hpp
+--- a/copy_sm90_bulk_reduce.hpp
++++ b/copy_sm90_bulk_reduce.hpp
+@@ -46,4 +46,51 @@
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
++// marincpp: plain bulk store (the first head of a GQA group in deterministic mode stores instead of adding)
++struct SM90_BULK_STORE
++{
++  CUTE_HOST_DEVICE static void
++  copy(float const* smem_ptr,
++       float      * gmem_ptr, int32_t store_bytes, uint64_t cache_hint)
++  {
++#if defined(CUTE_ARCH_TMA_SM90_ENABLED)
++    uint32_t smem_int_ptr  = cast_smem_ptr_to_uint(smem_ptr);
++    asm volatile("cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint [%0], [%1], %2, %3;\n"
++                     :
++                     : "l"(gmem_ptr), "r"(smem_int_ptr), "r"(store_bytes), "l"(cache_hint)
++                     : "memory");
++#else
++    CUTE_INVALID_CONTROL_PATH("Trying to use BULK_STORE without CUTE_ARCH_TMA_SM90_ENABLED.");
++#endif
++  }
++};
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++
++// marincpp: deterministic hand-off of a global tile between bulk writers ordered by a semaphore. tma_store_wait
++// (cp.async.bulk.wait_group.read) returns once shared memory has been read, not when the global add has landed; the
++// writer must wait for its writes (wait_group 0) and order them before its generic-proxy release (proxy fence), and
++// the next writer orders its acquire before its own async-proxy access.
++struct SM90_BULK_HANDOFF
++{
++  CUTE_HOST_DEVICE static void
++  release_ready()
++  {
++#if defined(CUTE_ARCH_TMA_SM90_ENABLED)
++    asm volatile("cp.async.bulk.wait_group 0;\n"
++                 "fence.proxy.async.global;\n" : : : "memory");
++#endif
++  }
++
++  CUTE_HOST_DEVICE static void
++  after_acquire()
++  {
++#if defined(CUTE_ARCH_TMA_SM90_ENABLED)
++    asm volatile("fence.proxy.async.global;\n" : : : "memory");
++#endif
++  }
++};
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++
+ } // end namespace cute
+diff -ru a/cuda_check.h b/cuda_check.h
+--- a/cuda_check.h
++++ b/cuda_check.h
+@@ -7,14 +7,18 @@
+ #include <assert.h>
+ #include <stdlib.h>
+ 
++#include <stdexcept>
++#include <string>
++
+ #include <cutlass/cutlass.h>
+ 
+ #define CHECK_CUDA(call)                        \
+     do {                                                                                                  \
+         cudaError_t status_ = call;                                                                       \
+         if (status_ != cudaSuccess) {                                                                     \
+-            fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__, __LINE__, cudaGetErrorString(status_)); \
+-            exit(1);                                                                                      \
++            /* marincpp: throw (the caller reports it) instead of exit(1) */                                \
++            throw std::runtime_error(std::string("FA3 CUDA error (" __FILE__ ":") + std::to_string(__LINE__) \
++                                     + "): " + cudaGetErrorString(status_));                              \
+         }                                                                                                 \
+     } while(0)
+ 
+@@ -24,7 +28,8 @@
+     do {                                                                                                  \
+         cutlass::Status status_ = (call);                                                                 \
+         if (status_ != cutlass::Status::kSuccess) {                                                        \
+-            fprintf(stderr, "CUTLASS error (%s:%d): %s\n", __FILE__, __LINE__, cutlass::cutlassGetStatusString(status_)); \
+-            exit(1);                                                                                      \
++            /* marincpp: throw (the caller reports it) instead of exit(1) */                                \
++            throw std::runtime_error(std::string("FA3 CUTLASS error (" __FILE__ ":") + std::to_string(__LINE__) \
++                                     + "): " + cutlass::cutlassGetStatusString(status_));                 \
+         }                                                                                                 \
+     } while(0)
+diff -ru a/epilogue_bwd.hpp b/epilogue_bwd.hpp
+--- a/epilogue_bwd.hpp
++++ b/epilogue_bwd.hpp
+@@ -115,6 +115,7 @@
+         int* dv_semaphore;
+         int const* cu_seqlens;
+         int const* seqused;
++        bool const first_store = false;  // marincpp: GQA epilogue only (same launch-template initializer)
+     };
+ 
+     // Device side kernel params
+@@ -376,6 +377,7 @@
+         int* dv_semaphore;
+         int const* cu_seqlens;
+         int const* seqused;
++        bool const first_store = false;  // marincpp: deterministic, head 0 of a group stores (no zeroed accumulator)
+     };
+ 
+     // Device side kernel params
+@@ -392,6 +394,7 @@
+         int const num_batch;
+         int const* cu_seqlens = nullptr;
+         int const* seqused = nullptr;
++        bool const first_store = false;
+     };
+ 
+     static Params
+@@ -403,7 +406,7 @@
+         return {args.ptr_dKaccum, args.shape_dKaccum, args.stride_dKaccum, args.ptr_dVaccum, args.shape_dVaccum, args.stride_dVaccum,
+                 cutlass::FastDivmod(cute::ceil_div(args.num_heads_q, get<1>(args.shape_dKaccum))),
+                 args.dk_semaphore, args.dv_semaphore,
+-                args.num_batch, args.cu_seqlens, args.seqused};
++                args.num_batch, args.cu_seqlens, args.seqused, Deterministic && args.first_store};
+     }
+ 
+     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
+@@ -468,9 +471,16 @@
+             cutlass::arch::fence_view_async_shared();
+             cutlass::arch::NamedBarrier::sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+             if (thread_idx == 0) {
+-                SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdKV_flat.data()), raw_pointer_cast(gdVaccum.data()), dKV_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
+-                tma_store_arrive();
+-                tma_store_wait<0>();
++                if constexpr (Deterministic) { SM90_BULK_HANDOFF::after_acquire(); }  // marincpp
++                if (params.first_store && bidh_idx_in_group == 0) {  // marincpp: the group's first head stores
++                    SM90_BULK_STORE::copy(raw_pointer_cast(sdKV_flat.data()), raw_pointer_cast(gdVaccum.data()), dKV_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
++                    tma_store_arrive();
++                } else {
++                    SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdKV_flat.data()), raw_pointer_cast(gdVaccum.data()), dKV_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
++                    tma_store_arrive();
++                }
++                // marincpp: in deterministic mode the next head's add must find this tile's writes in memory
++                if constexpr (Deterministic) { SM90_BULK_HANDOFF::release_ready(); } else { tma_store_wait<0>(); }
+             }
+         } else {
+             Tensor tdVrdV_atomic = r2g_thr_copy_dKVaccum.retile_S(tdVrdV);
+@@ -499,9 +509,16 @@
+             cutlass::arch::fence_view_async_shared();
+             cutlass::arch::NamedBarrier::sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+             if (thread_idx == 0) {
+-                SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdKV_flat.data()), raw_pointer_cast(gdKaccum.data()), dKV_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
+-                tma_store_arrive();
+-                tma_store_wait<0>();
++                if constexpr (Deterministic) { SM90_BULK_HANDOFF::after_acquire(); }  // marincpp
++                if (params.first_store && bidh_idx_in_group == 0) {  // marincpp: the group's first head stores
++                    SM90_BULK_STORE::copy(raw_pointer_cast(sdKV_flat.data()), raw_pointer_cast(gdKaccum.data()), dKV_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
++                    tma_store_arrive();
++                } else {
++                    SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdKV_flat.data()), raw_pointer_cast(gdKaccum.data()), dKV_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
++                    tma_store_arrive();
++                }
++                // marincpp: in deterministic mode the next head's add must find this tile's writes in memory
++                if constexpr (Deterministic) { SM90_BULK_HANDOFF::release_ready(); } else { tma_store_wait<0>(); }
+             }
+         } else {
+             Tensor tdKrdK_atomic = r2g_thr_copy_dKVaccum.retile_S(tdKrdK);
+diff -ru a/flash_bwd_kernel_sm90.h b/flash_bwd_kernel_sm90.h
+--- a/flash_bwd_kernel_sm90.h
++++ b/flash_bwd_kernel_sm90.h
+@@ -248,6 +248,10 @@
+ 
+             mainloop.mma_init();
+             scheduler.init_consumer();
++            // marincpp: smem_k/v free for the first tile (see CollectiveMainloop::load, kv_sync)
++            if (params.mainloop.kv_sync) {
++                cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
++            }
+ 
+             int work_idx = 0;
+             CUTLASS_PRAGMA_NO_UNROLL
+@@ -267,6 +271,10 @@
+                 if (tile_valid) {
+                     epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage, tiled_mma_dKV,
+                                    threadIdx.x - NumCopyThreads, block_coord);
++                    // marincpp: the epilogue (smem aliased with smem_k/v) is done with shared memory
++                    if (params.mainloop.kv_sync) {
++                        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
++                    }
+                 } else {
+                     epilogue.store_zero(params.epilogue, threadIdx.x - NumCopyThreads, block_coord);
+                 }
+diff -ru a/flash_bwd_launch_template.h b/flash_bwd_launch_template.h
+--- a/flash_bwd_launch_template.h
++++ b/flash_bwd_launch_template.h
+@@ -29,8 +29,11 @@
+           int Stages_dO=2, int Stages_dS_or_QSm80=2,
+           bool SdP_swapAB=true, bool dKV_swapAB=false, bool dQ_swapAB=false,
+           int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
+-          bool V_in_regs=false>
++          bool V_in_regs=false, bool NmList=false>
+ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
++    // marincpp: NmList = varlen backward over the device work lists of Flash_bwd_params (nm_*): the pre- and
++    // postprocess grids cover only the tiles in the lists and the main kernel runs NmBwdListScheduler.
++    static_assert(!NmList || (Varlen && Arch >= 90), "the work-list backward is varlen sm90 only");
+     static_assert(!(Is_causal && Is_local), "Is_causal and Is_local cannot be true at the same time.");
+     using ElementAccum = float;
+     using ArchTag = std::conditional_t<Arch >= 90, cutlass::arch::Sm90, cutlass::arch::Sm80>;
+@@ -58,7 +61,8 @@
+         {seqlen_q_rounded, params.h, batch_q},  // shape_dPsum
+         {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_dPsum
+         static_cast<float*>(params.softmax_lse_ptr),
+-        {_1{}, seqlen_q, !is_varlen_q ? params.h * params.seqlen_q : 0},  // stride_LSE
++        {_1{}, params.lse_head_stride ? params.lse_head_stride : seqlen_q,  // stride_LSE (marincpp: layout override)
++         !is_varlen_q ? (params.lse_batch_stride ? params.lse_batch_stride : params.h * params.seqlen_q) : 0},
+         static_cast<float*>(params.softmax_lse_log2_ptr),
+         {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_LSE_log2
+         static_cast<ElementAccum*>(params.dq_accum_ptr),
+@@ -67,11 +71,12 @@
+         params.b,
+         params.dq_semaphore,
+         params.cu_seqlens_q,
+-        params.seqused_q
++        params.seqused_q,
++        NmList ? params.nm_mtiles : nullptr, NmList ? params.nm_mtile_count : nullptr
+     };
+     typename PreprocessKernel::Params preprocess_params = PreprocessKernel::to_underlying_arguments(preprocess_args);
+     int num_m_block = cute::ceil_div(params.seqlen_q, kBlockM);
+-    dim3 grid_m(num_m_block, params.h, params.b);
++    dim3 grid_m = NmList ? dim3(params.nm_pre_grid, params.h, 1) : dim3(num_m_block, params.h, params.b);
+     CHECK_CUTLASS(cutlass::kernel_launch<PreprocessKernel>(grid_m, PreprocessKernel::MaxThreadsPerBlock, PreprocessKernel::SharedStorageSize, stream, preprocess_params, false /*launch_with_pdl*/));
+ 
+     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
+@@ -94,9 +99,13 @@
+         flash::CollectiveEpilogueBwdGQA<TileShape_MNK, ElementAccum, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, Deterministic>
+     >;
+     using Scheduler = std::conditional_t<
+-        Is_causal,
+-        flash::SingleTileBwdLPTScheduler<Varlen, kBlockN, Is_causal && Deterministic /*SPT*/>,
+-        flash::SingleTileScheduler<Varlen, false /*Split*/, false /*PackGQA*/, kBlockN>
++        NmList,
++        flash::NmBwdListScheduler,
++        std::conditional_t<
++            Is_causal || (Is_local && Deterministic),  // marincpp: doc-causal deterministic, highest n block first
++            flash::SingleTileBwdLPTScheduler<Varlen, kBlockN, Deterministic /*SPT*/>,
++            flash::SingleTileScheduler<Varlen, false /*Split*/, false /*PackGQA*/, kBlockN>
++        >
+     >;
+     using AttnKernel = std::conditional_t<
+         Arch >= 90,
+@@ -131,7 +140,9 @@
+         params.b,
+         params.dq_semaphore,
+         params.cu_seqlens_q, params.cu_seqlens_k,
+-        params.seqused_q, params.seqused_k
++        params.seqused_q, params.seqused_k,
++        params.doc_lo, params.doc_hi,  // marincpp doc-causal
++        NmList && params.nm_persistent  // kv_sync
+     };
+     // The case work with GQA is ugly but idk how to fix it.
+     typename CollectiveEpilogue::Arguments epilogue_args {
+@@ -171,6 +182,7 @@
+         params.dv_semaphore,
+         params.cu_seqlens_k,
+         params.seqused_k,
++        params.nm_gqa_first_store  // marincpp (GQA epilogue only)
+     };
+ 
+     int num_blocks_n = cutlass::ceil_div(params.seqlen_k, get<1>(TileShape_MNK{}));
+@@ -189,7 +201,13 @@
+         mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args
+     });
+ 
+-    dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
++    dim3 grid_dims;
++    if constexpr (NmList) {
++        kernel_params.scheduler = {params.nm_ntiles, params.nm_ntile_count, params.h, params.nm_persistent};
++        grid_dims = dim3(params.nm_grid);
++    } else {
++        grid_dims = AttnKernel::get_grid_shape(kernel_params);
++    }
+     dim3 block_dims = AttnKernel::get_block_shape();
+     int smem_size = AttnKernel::SharedStorageSize;
+     // int smem_size_q = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_q));
+@@ -236,11 +254,12 @@
+         {params.dq_row_stride, _1{}, params.dq_head_stride, params.dq_batch_stride},  // stride_dQ
+         params.scale_softmax,
+         params.cu_seqlens_q,
+-        params.seqused_q
++        params.seqused_q,
++        NmList ? params.nm_mtiles : nullptr, NmList ? params.nm_mtile_count : nullptr
+     };
+     typename PostprocessKernel::Params postprocess_params = PostprocessKernel::to_underlying_arguments(postprocess_args);
+     int num_m_block_postprocess = cute::ceil_div(params.seqlen_q, get<0>(TileShape_MK{}));
+-    dim3 grid_m_postprocess(num_m_block_postprocess, params.h, params.b);
++    dim3 grid_m_postprocess = NmList ? dim3(params.nm_pre_grid, params.h, 1) : dim3(num_m_block_postprocess, params.h, params.b);
+     int smem_size_postprocess = PostprocessKernel::SharedStorageSize;
+     if (smem_size_postprocess >= 48 * 1024) {
+         CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<PostprocessKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
+@@ -263,7 +282,8 @@
+             {params.dk_row_stride, _1{}, params.dk_head_stride, params.dk_batch_stride},  // stride_dK
+             1.f,
+             params.cu_seqlens_k,
+-            params.seqused_k
++            params.seqused_k,
++            NmList ? params.nm_ktiles : nullptr, NmList ? params.nm_ktile_count : nullptr
+         };
+         typename PostprocessKerneldKV::Params postprocess_dK_params = PostprocessKerneldKV::to_underlying_arguments(postprocess_dK_args);
+         typename PostprocessKerneldKV::Arguments postprocess_dV_args {
+@@ -275,11 +295,12 @@
+             {params.dv_row_stride, _1{}, params.dv_head_stride, params.dv_batch_stride},  // stride_dV
+             1.f,
+             params.cu_seqlens_k,
+-            params.seqused_k
++            params.seqused_k,
++            NmList ? params.nm_ktiles : nullptr, NmList ? params.nm_ktile_count : nullptr
+         };
+         typename PostprocessKerneldKV::Params postprocess_dV_params = PostprocessKerneldKV::to_underlying_arguments(postprocess_dV_args);
+         int num_n_block_postprocess = cute::ceil_div(params.seqlen_k, get<0>(TileShape_NK{}));
+-        dim3 grid_n_postprocess(num_n_block_postprocess, params.h_k, params.b);
++        dim3 grid_n_postprocess = NmList ? dim3(params.nm_post_kv_grid, params.h_k, 1) : dim3(num_n_block_postprocess, params.h_k, params.b);
+         int smem_size_postprocess = PostprocessKerneldKV::SharedStorageSize;
+         if (smem_size_postprocess >= 48 * 1024) {
+             CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<PostprocessKerneldKV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
+diff -ru a/flash_bwd_postprocess_kernel.h b/flash_bwd_postprocess_kernel.h
+--- a/flash_bwd_postprocess_kernel.h
++++ b/flash_bwd_postprocess_kernel.h
+@@ -118,6 +118,9 @@
+         float const softmax_scale;
+         int const* cu_seqlens = nullptr;
+         int const* seqused = nullptr;
++        // marincpp work list (varlen): tile x of the grid is (segment, block) pair tiles[x]; x >= *tile_count exits
++        int2 const* tiles = nullptr;
++        int const* tile_count = nullptr;
+     };
+ 
+     // Kernel entry point API
+@@ -131,6 +134,9 @@
+         float const softmax_scale;
+         int const* cu_seqlens = nullptr;
+         int const* seqused = nullptr;
++        // marincpp work list (varlen): tile x of the grid is (segment, block) pair tiles[x]; x >= *tile_count exits
++        int2 const* tiles = nullptr;
++        int const* tile_count = nullptr;
+     };
+ 
+     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
+@@ -146,7 +152,9 @@
+             args.stride_dQ,
+             args.softmax_scale,
+             args.cu_seqlens,
+-            args.seqused
++            args.seqused,
++            args.tiles,
++            args.tile_count
+         };
+     }
+ 
+@@ -163,9 +171,15 @@
+         Tensor sdQt = make_tensor(make_smem_ptr(shared_storage.smem_dq.data()), SmemLayoutdQt{});
+ 
+         int const thread_idx = threadIdx.x;
+-        int const m_block = blockIdx.x;
++        int m_block = blockIdx.x;
+         int const bidh = blockIdx.y;
+-        int const bidb = blockIdx.z;
++        int bidb = blockIdx.z;
++        if (params.tiles != nullptr) {  // marincpp work list
++            if (int(blockIdx.x) >= *params.tile_count) { return; }
++            int2 const t = params.tiles[blockIdx.x];
++            bidb = t.x;
++            m_block = t.y;
++        }
+ 
+         flash::SeqlenInfo<true /*Varlen*/, kBlockM> seqlen_info(bidb, size<0>(params.shape_dQ), params.cu_seqlens, params.seqused);
+         bool const is_varlen = params.cu_seqlens;
+diff -ru a/flash_bwd_preprocess_kernel.h b/flash_bwd_preprocess_kernel.h
+--- a/flash_bwd_preprocess_kernel.h
++++ b/flash_bwd_preprocess_kernel.h
+@@ -87,6 +87,9 @@
+         int* dq_semaphore;
+         int const* cu_seqlens = nullptr;
+         int const* seqused = nullptr;
++        // marincpp work list (varlen): tile x of the grid is (segment, block) pair tiles[x]; x >= *tile_count exits
++        int2 const* tiles = nullptr;
++        int const* tile_count = nullptr;
+     };
+ 
+     // Kernel entry point API
+@@ -110,6 +113,9 @@
+         int* dq_semaphore;
+         int const* cu_seqlens = nullptr;
+         int const* seqused = nullptr;
++        // marincpp work list (varlen): tile x of the grid is (segment, block) pair tiles[x]; x >= *tile_count exits
++        int2 const* tiles = nullptr;
++        int const* tile_count = nullptr;
+     };
+ 
+     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
+@@ -135,7 +141,9 @@
+             args.num_batch,
+             args.dq_semaphore,
+             args.cu_seqlens,
+-            args.seqused
++            args.seqused,
++            args.tiles,
++            args.tile_count
+         };
+     }
+ 
+@@ -146,9 +154,15 @@
+         static constexpr int kBlockM = get<0>(TileShape_MK{});
+ 
+         int const thread_idx = threadIdx.x;
+-        int const m_block = blockIdx.x;
++        int m_block = blockIdx.x;
+         int const bidh = blockIdx.y;
+-        int const bidb = blockIdx.z;
++        int bidb = blockIdx.z;
++        if (params.tiles != nullptr) {  // marincpp work list
++            if (int(blockIdx.x) >= *params.tile_count) { return; }
++            int2 const t = params.tiles[blockIdx.x];
++            bidb = t.x;
++            m_block = t.y;
++        }
+ 
+         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info(bidb, size<0>(params.shape_O), params.cu_seqlens, params.seqused);
+         bool const is_varlen = Varlen && params.cu_seqlens;
+diff -ru a/flash_fwd_launch_template.h b/flash_fwd_launch_template.h
+--- a/flash_fwd_launch_template.h
++++ b/flash_fwd_launch_template.h
+@@ -129,7 +129,8 @@
+         params.kv_batch_idx,
+         params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
+         params.seqused_q, params.seqused_k,
+-        params.leftpad_k, params.seqlens_rotary
++        params.leftpad_k, params.seqlens_rotary,
++        params.doc_lo, params.doc_hi  // marincpp doc-causal
+     };
+     typename CollectiveEpilogue::Arguments epilogue_args {
+         static_cast<ElementOut*>(params.o_ptr),
+@@ -138,7 +139,8 @@
+         static_cast<float*>(params.oaccum_ptr),
+         {params.oaccum_row_stride, _1{}, params.oaccum_head_stride, !is_varlen_q ? params.oaccum_batch_stride : 0, params.oaccum_split_stride}, // stride_O_partial
+         static_cast<float*>(params.softmax_lse_ptr),
+-        {_1{}, seqlen_q, !is_varlen_q ? params.h * seqlen_q : 0, 0},  // stride_LSE
++        {_1{}, params.lse_head_stride ? params.lse_head_stride : seqlen_q,  // stride_LSE (marincpp: layout override)
++         !is_varlen_q ? (params.lse_batch_stride ? params.lse_batch_stride : params.h * seqlen_q) : 0, 0},
+         static_cast<float*>(params.softmax_lseaccum_ptr),
+         {_1{}, params.lseaccum_head_stride, !is_varlen_q ? params.lseaccum_batch_stride : 0, params.lseaccum_split_stride},  // stride_LSE_partial
+         params.h_k,
+diff -ru a/flash.h b/flash.h
+--- a/flash.h
++++ b/flash.h
+@@ -165,6 +165,16 @@
+ 
+     int arch;
+     int num_sm;
++
++    // marincpp (third_party/fa3-hopper/README.md). All zero / nullptr = stock FA3 behaviour.
++    // doc-causal masking (batch mode, Is_local): [b, seqlen] row-relative segment start of every query position (doc_lo)
++    // and segment end, exclusive, of every key position (doc_hi). Key c is visible to query r iff doc_lo[r] <= c <= r.
++    int const* doc_lo;
++    int const* doc_hi;
++    // LSE layout override (batch mode): element (row, head, batch) at row + head * lse_head_stride + batch *
++    // lse_batch_stride, so a [H, b * seqlen] buffer is one [H, T] tensor. 0 = stock layout.
++    index_t lse_head_stride;
++    index_t lse_batch_stride;
+ };
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+@@ -211,6 +221,22 @@
+ 
+     bool deterministic;
+     index_t dq_accum_split_stride;
++
++    // marincpp work-list backward (varlen): built on the device by marincpp's prepare kernel.
++    //   nm_ntiles [*nm_ntile_count] main-kernel work items (segment, n_block | head << 16): segments longest first,
++    //   then head, then n descending. nm_mtiles [*nm_mtile_count] (segment, m_block) pairs of kBlockM rows (pre- and
++    //   postprocess); nm_ktiles [*nm_ktile_count] (segment, n_block) pairs for the GQA dK/dV postprocess.
++    int2 const* nm_ntiles;
++    int const* nm_ntile_count;
++    int2 const* nm_mtiles;
++    int const* nm_mtile_count;
++    int2 const* nm_ktiles;
++    int const* nm_ktile_count;
++    int nm_grid;              // CTAs of the main backward kernel (work-list mode)
++    bool nm_persistent;       // CTA c runs items c, c + grid, ... (else one item per CTA)
++    int nm_pre_grid;          // CTAs (x) of the pre/postprocess kernels in work-list mode
++    int nm_post_kv_grid;
++    bool nm_gqa_first_store;  // deterministic GQA: the group's first head stores dK/dV accumulators (no memset)
+ };
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+diff -ru a/mainloop_bwd_sm90_tma_gmma_ws.hpp b/mainloop_bwd_sm90_tma_gmma_ws.hpp
+--- a/mainloop_bwd_sm90_tma_gmma_ws.hpp
++++ b/mainloop_bwd_sm90_tma_gmma_ws.hpp
+@@ -320,6 +320,11 @@
+         int const* const cu_seqlens_k = nullptr;
+         int const* const seqused_q = nullptr;
+         int const* const seqused_k = nullptr;
++        // marincpp: doc-causal segment arrays (batch mode, Is_local), KV smem handoff between work tiles (persistent
++        // work-list scheduler)
++        int const* const doc_lo = nullptr;
++        int const* const doc_hi = nullptr;
++        bool const kv_sync = false;
+     };
+ 
+     // Device side kernel params
+@@ -350,6 +355,11 @@
+         int const* const cu_seqlens_k = nullptr;
+         int const* const seqused_q = nullptr;
+         int const* const seqused_k = nullptr;
++        // marincpp: doc-causal segment arrays (batch mode, Is_local), KV smem handoff between work tiles (persistent
++        // work-list scheduler)
++        int const* const doc_lo = nullptr;
++        int const* const doc_hi = nullptr;
++        bool const kv_sync = false;
+     };
+ 
+     static Params
+@@ -406,7 +416,15 @@
+                 args.window_size_left, args.window_size_right, attention_chunk_divmod,
+                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
+                 args.num_batch, args.dq_semaphore,
+-                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k};
++                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k,
++                args.doc_lo, args.doc_hi, args.kv_sync};
++    }
++
++    // marincpp doc-causal: the segment arrays of batch row bidb (nullptr outside doc mode)
++    CUTLASS_DEVICE
++    static int const* doc_row(Params const& params, int const* p, int const bidb) {
++        if constexpr (!Is_local || Varlen) { return nullptr; }
++        return p == nullptr ? nullptr : p + int64_t(bidb) * get<0>(params.shape_Q);
+     }
+ 
+     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
+@@ -437,7 +455,8 @@
+         };
+         auto [m_block_min, m_block_max] = BlockMN_t::get_m_block_min_max(
+             seqlen_info, n_block, bidb,
+-            params.window_size_left, params.window_size_right, 0 /*sink_token_length*/);
++            params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
++            doc_row(params, params.doc_hi, bidb));
+         // It's possible to have m_block_max <= m_block_min. Loading Q, K can cause illegal memory access.
+         if constexpr (Is_causal || Is_local || Varlen) {
+             if (m_block_max <= m_block_min) {
+@@ -517,6 +536,11 @@
+ 
+         // // Wait for the MMA warpgroups to say that smem_k and smem_v are ready
+         // cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
++        // marincpp: a persistent CTA must not overwrite smem_k/v (aliased by the dK/dV epilogue) before the previous
++        // tile's epilogue is done (FlashAttnBwdSm90 arrives once at start and after every stored tile).
++        if (params.kv_sync) {
++            cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
++        }
+ 
+         if (lane_predicate) {
+             // Copy K tile and V tile from GMEM to SMEM.
+@@ -605,11 +629,16 @@
+         };
+         auto [m_block_min, m_block_max] = BlockMN_t::get_m_block_min_max(
+             seqlen_info, n_block, bidb, params.window_size_left,
+-            params.window_size_right, 0 /*sink_token_length*/);
++            params.window_size_right, 0 /*sink_token_length*/, doc_row(params, params.doc_hi, bidb));
+         // It's possible to have m_block_max <= m_block_min. Exit early
+         // Though if local and deterministic, still need to increment dq semaphore
++        // marincpp doc-causal: the dQ contributors of an m block are exactly the n blocks that visit it (no padding
++        // arrivals; see the deterministic wait below)
++        int const* const doc_lo_dq = doc_row(params, params.doc_lo, bidb);
+         if constexpr ((Is_causal || Is_local || Varlen) && !(Is_local && Deterministic)) {
+             if (m_block_max <= m_block_min) { return; }
++        } else {
++            if (doc_lo_dq != nullptr && m_block_max <= m_block_min) { return; }
+         }
+ 
+         Tensor sdQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_dqacc.data()), SmemLayoutdQaccum{});
+@@ -633,7 +662,9 @@
+         #pragma unroll 2
+         for (; m_block < m_block_max; ++m_block) {
+             if constexpr (Deterministic) {
+-                if constexpr(Is_causal) {
++                // marincpp doc-causal: the n blocks visiting m block m are [doc_lo[first row] / kBlockN, causal limit);
++                // like causal they accumulate in descending order (the higher n blocks reach m first)
++                if (Is_causal || doc_lo_dq != nullptr) {
+                     int n_block_max_for_m_block = std::min(n_block_global_max, cute::ceil_div((m_block + 1) * kBlockM + seqlen_info.seqlen_k - seqlen_info.seqlen_q, kBlockN));
+                     Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head, n_block_max_for_m_block - 1 - n_block);
+                 } else {
+@@ -644,6 +675,7 @@
+             for (int warpgroup_idx = 0; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
+                 cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);  // sdQ full, to be written to gmem
+                 if (lane_predicate) {
++                    if constexpr (Deterministic) { SM90_BULK_HANDOFF::after_acquire(); }  // marincpp
+                     SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()), raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_block).data()), dQ_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
+                     tma_store_arrive();
+                 }
+@@ -654,10 +686,14 @@
+                 cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warpgroup_idx /*id*/);  // sdQ empty, ready to be written to
+             });
+             if constexpr (Deterministic) {
++                // marincpp: the next n block adds only after this block's adds have landed (tma_store_wait above
++                // waits only for the shared-memory reads)
++                if (lane_predicate) { SM90_BULK_HANDOFF::release_ready(); }
+                 Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
+             }
+         }
+         if constexpr (Is_local && Deterministic) {
++            if (doc_lo_dq != nullptr) { return; }   // marincpp doc-causal: only visitors count
+             int const m_block_global_max = cute::ceil_div(seqlen_info.seqlen_q, kBlockM);
+             #pragma unroll 2
+             for (; m_block < m_block_global_max; ++m_block) {
+@@ -703,7 +739,7 @@
+         };
+         auto [m_block_min, m_block_max] = BlockMN_t::get_m_block_min_max(
+             seqlen_info, n_block, bidb, params.window_size_left,
+-            params.window_size_right, 0 /*sink_token_length*/);
++            params.window_size_right, 0 /*sink_token_length*/, doc_row(params, params.doc_hi, bidb));
+         // It's possible to have m_block_max <= m_block_min. Exit early
+         if constexpr (Is_causal || Is_local || Varlen) {
+             if (m_block_max <= m_block_min) { return false; }
+@@ -810,7 +846,8 @@
+ 
+         flash::Mask<kBlockM, kBlockN, false /*PackGQA*/, TiledMmaSdP, SdP_swapAB> mask(
+             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
+-            params.attention_chunk_divmod, params.qhead_per_khead_divmod
++            params.attention_chunk_divmod, params.qhead_per_khead_divmod,
++            doc_row(params, params.doc_lo, bidb), doc_row(params, params.doc_hi, bidb)  // marincpp doc-causal
+         );
+ 
+         int m_block = m_block_min;
+@@ -1014,9 +1051,12 @@
+ 
+         static constexpr int kBlockM = get<0>(TileShape_MNK{});
+         static constexpr int kBlockN = get<1>(TileShape_MNK{});
++        int const* const doc_hi_row = doc_row(params, params.doc_hi, bidb);
+         int const m_block_max_before_local_mask = !Is_local || !SeparateMaskingIterations
+             ? m_block_max
+-            : std::min(m_block_max, (n_block * kBlockN + seqlen_q - seqlen_k + params.window_size_left) / kBlockM);
++            : (doc_hi_row != nullptr  // marincpp doc-causal
++               ? BlockMN_t::get_m_block_max_before_doc_mask(n_block, m_block_max, doc_hi_row)
++               : std::min(m_block_max, (n_block * kBlockN + seqlen_q - seqlen_k + params.window_size_left) / kBlockM));
+ 
+         auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block); };
+         CUTLASS_PRAGMA_NO_UNROLL
+diff -ru a/mainloop_fwd_sm90_tma_gmma_ws.hpp b/mainloop_fwd_sm90_tma_gmma_ws.hpp
+--- a/mainloop_fwd_sm90_tma_gmma_ws.hpp
++++ b/mainloop_fwd_sm90_tma_gmma_ws.hpp
+@@ -396,6 +396,9 @@
+         int const* const seqused_k = nullptr;
+         int const* const leftpad_k = nullptr;
+         int const* const seqlens_rotary = nullptr;
++        // marincpp doc-causal (Is_local, non-varlen): [batch, seqlen] segment start / end of every position, row-relative
++        int const* const doc_lo = nullptr;
++        int const* const doc_hi = nullptr;
+     };
+ 
+     // Device side kernel params
+@@ -453,6 +456,8 @@
+         int const* const seqused_k = nullptr;
+         int const* const leftpad_k = nullptr;
+         int const *const seqlens_rotary = nullptr;
++        int const* const doc_lo = nullptr;
++        int const* const doc_hi = nullptr;
+     };
+ 
+     static Params
+@@ -564,7 +569,15 @@
+                 !Split ? 1 : args.num_splits,
+                 args.kv_batch_idx,
+                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
+-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
++                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
++                args.doc_lo, args.doc_hi};
++    }
++
++    // marincpp doc-causal: the segment arrays of batch row bidb (nullptr outside doc mode)
++    CUTLASS_DEVICE
++    static int const* doc_row(Params const& params, int const* p, int const bidb) {
++        if constexpr (!Is_local || Varlen) { return nullptr; }
++        return p == nullptr ? nullptr : p + int64_t(bidb) * get<0>(params.shape_Q);
+     }
+ 
+     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
+@@ -608,7 +621,7 @@
+         auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
+             seqlen_info, m_block, bidb, split_idx, params.num_splits,
+             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
+-            params.qhead_per_khead_divmod);
++            params.qhead_per_khead_divmod, doc_row(params, params.doc_lo, bidb));
+         // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
+         if constexpr (Is_causal || Is_local || Varlen || Split) {
+             if (n_block_max <= n_block_min) {
+@@ -977,7 +990,7 @@
+         auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
+             seqlen_info, m_block, bidb, split_idx, params.num_splits,
+             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
+-            params.qhead_per_khead_divmod);
++            params.qhead_per_khead_divmod, doc_row(params, params.doc_lo, bidb));
+         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
+         if constexpr (Is_causal || Is_local || Varlen || Split) {
+             if (n_block_max <= n_block_min) { return false; }
+@@ -1061,7 +1074,8 @@
+ 
+         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMmaQK> mask(
+             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
+-            params.attention_chunk_divmod, params.qhead_per_khead_divmod
++            params.attention_chunk_divmod, params.qhead_per_khead_divmod,
++            doc_row(params, params.doc_lo, bidb), doc_row(params, params.doc_hi, bidb)
+         );
+ 
+         float softcap_val = params.softcap_val;
+@@ -1219,7 +1233,7 @@
+ 
+             int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
+                 seqlen_info, m_block, n_block_min, params.window_size_left,
+-                params.attention_chunk_divmod, params.qhead_per_khead_divmod);
++                params.attention_chunk_divmod, params.qhead_per_khead_divmod, doc_row(params, params.doc_lo, bidb));
+             auto no_mask_fn = [](auto& tSrS, int n_block) { };
+             #pragma unroll 1
+             for (; n_block >= n_block_min_before_local_mask; --n_block) {
+@@ -1319,7 +1333,7 @@
+             }
+             int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
+                 seqlen_info, m_block, n_block_min, params.window_size_left,
+-                params.attention_chunk_divmod, params.qhead_per_khead_divmod);
++                params.attention_chunk_divmod, params.qhead_per_khead_divmod, doc_row(params, params.doc_lo, bidb));
+             auto no_mask_fn = [](auto& tSrS, int n_block) { };
+             #pragma unroll 1
+             for (; n_block >= n_block_min_before_local_mask; --n_block) {
+@@ -1371,7 +1385,7 @@
+         auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
+             seqlen_info, m_block, bidb, split_idx, params.num_splits,
+             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
+-            params.qhead_per_khead_divmod);
++            params.qhead_per_khead_divmod, doc_row(params, params.doc_lo, bidb));
+         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
+         if constexpr (Is_causal || Is_local || Varlen || Split) {
+             if (n_block_max <= n_block_min) { return false; }
+diff -ru a/mask.h b/mask.h
+--- a/mask.h
++++ b/mask.h
+@@ -24,12 +24,17 @@
+     int const window_size_left, window_size_right, sink_token_length;
+     cutlass::FastDivmod const attention_chunk_divmod;
+     cutlass::FastDivmod const qhead_per_khead_divmod;
++    // marincpp doc-causal (Local_mask with these set): key c is visible to query r iff doc_lo[r] <= c <= r, where
++    // doc_lo[r] is the start of r's segment and doc_hi[c] the end (exclusive) of c's segment, both within the batch row.
++    int const* const doc_lo;
++    int const* const doc_hi;
+ 
+     CUTLASS_DEVICE
+     Mask(const int thread_idx, const int seqlen_q, const int seqlen_k,
+          const int window_size_left, const int window_size_right, const int sink_token_length,
+          cutlass::FastDivmod const &attention_chunk_divmod,
+-         cutlass::FastDivmod const &qhead_per_khead_divmod)
++         cutlass::FastDivmod const &qhead_per_khead_divmod,
++         int const* doc_lo = nullptr, int const* doc_hi = nullptr)
+         : thread_idx(thread_idx)
+         , seqlen_q(seqlen_q)
+         , seqlen_k(seqlen_k)
+@@ -38,6 +43,8 @@
+         , sink_token_length(sink_token_length)
+         , attention_chunk_divmod(attention_chunk_divmod)
+         , qhead_per_khead_divmod(qhead_per_khead_divmod)
++        , doc_lo(doc_lo)
++        , doc_hi(doc_hi)
+     {
+     };
+ 
+@@ -113,6 +120,9 @@
+                             ? row_idx + local_row_offset_right
+                             : __viaddmin_s32(row_idx, local_row_offset_right, seqlenk_col_limit);
+                         int col_limit_left = row_idx + local_row_offset_left;
++                        if (doc_lo != nullptr) {  // marincpp doc-causal: first visible key = the row's segment start
++                            col_limit_left = doc_lo[std::min(row_idx, seqlen_q - 1)] - n_block * kBlockN - thread_col_offset;
++                        }
+                         if (attention_chunk_divmod.divisor > 0) {
+                             int col_limit_left_chunk = flash::round_down(attention_chunk_divmod, row_idx + seqlen_k - seqlen_q) - n_block * kBlockN - thread_col_offset;
+                             col_limit_left = std::max(col_limit_left, col_limit_left_chunk);
+@@ -149,7 +159,11 @@
+                         // If col0 is beyond the column limit, we want to mask out the entire column, by setting
+                         // row limit to be kBlockM.
+                         int const row_limit_top = col0 >= seqlenk_col_limit ? kBlockM : col0 - causal_row_offset - window_size_right;
+-                        int const row_limit_bot = col0 < col_limit_sink ? kBlockM : col0 - causal_row_offset + window_size_left;
++                        int row_limit_bot = col0 < col_limit_sink ? kBlockM : col0 - causal_row_offset + window_size_left;
++                        if (doc_hi != nullptr) {  // marincpp doc-causal: last visible query = the key's segment end - 1
++                            int const col_g = std::min(col0 + thread_col_offset + n_block * kBlockN, seqlen_k - 1);
++                            row_limit_bot = doc_hi[col_g] - 1 - m_block * kBlockM - thread_row_offset;
++                        }
+                         #pragma unroll
+                         for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+                             int const row_idx = int(get<Row>(t0ScS_rowcol(m, _0{})));
+diff -ru a/tile_scheduler.hpp b/tile_scheduler.hpp
+--- a/tile_scheduler.hpp
++++ b/tile_scheduler.hpp
+@@ -488,6 +488,90 @@
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+ 
++// marincpp: backward scheduler over a device-built work list (varlen). Work item i is items[i] = (segment,
++// n_block | head << 16); the list runs segment by segment, longest first, and inside a segment head by head with n
++// descending (the CTAs running at once share one head's Q, dO, LSE and dPsum in L2). Persistent: CTA c runs items c, c + gridDim.x, ... (the
++// kernel then needs the KVEmpty handoff, CollectiveMainloopBwdSm90::Arguments::kv_sync); else one item per CTA and
++// CTAs past the item count exit at once. Every role of a CTA (producer, dQ writer, consumers) walks the same sequence
++// without communicating. Deterministic dQ/dK/dV ordering cannot deadlock: an item only waits for items with a smaller
++// index (the n blocks of one (segment, head) descend, as in FA3's deterministic dQ order; heads ascend inside a segment), and the smallest unfinished item
++// is always running.
++class NmBwdListScheduler {
++
++public:
++
++    using SharedStorage = int;
++
++    struct Params {
++        int2 const* pairs;   // items
++        int const* count;    // item count
++        int num_head;
++        bool persistent;
++    };
++
++    static Params
++    to_underlying_arguments(TileSchedulerArguments const& args) {
++        // run_flash_bwd sets pairs, count and persistent after AttnKernel::to_underlying_arguments
++        return {nullptr, nullptr, args.num_head, false};
++    }
++
++    struct WorkTileInfo {
++        int idx;
++        int block;
++        int bidh;
++        int bidb;
++
++        CUTLASS_DEVICE
++        bool
++        is_valid(Params const& params) const {
++            return bidb >= 0;
++        }
++
++        CUTLASS_DEVICE
++        cute::tuple<int32_t, int32_t, int32_t, int32_t>
++        get_block_coord(Params const& params) const {
++            return {block, bidh, bidb, 0 /*split_idx*/};
++        }
++    };
++
++    CUTLASS_DEVICE
++    NmBwdListScheduler(SharedStorage* const smem_scheduler) { }
++
++    CUTLASS_DEVICE
++    static WorkTileInfo
++    tile(Params const& params, int idx) {
++        if (idx >= *params.count) { return {idx, 0, 0, -1}; }
++        int2 const p = params.pairs[idx];
++        return {idx, p.y & 0xFFFF, p.y >> 16, p.x};
++    }
++
++    template<bool IsProducerWarp=false>
++    CUTLASS_DEVICE
++    WorkTileInfo
++    get_initial_work(Params const& params) const {
++        return tile(params, int(blockIdx.x));
++    }
++
++    CUTLASS_DEVICE
++    void
++    init_consumer() const {}
++
++    CUTLASS_DEVICE
++    void
++    prefetch_next_work(Params const& params, WorkTileInfo& current_work) const {}
++
++    template<bool IsProducerWarp=false>
++    CUTLASS_DEVICE
++    WorkTileInfo
++    get_next_work(Params const& params, WorkTileInfo const& current_work) const {
++        if (!params.persistent) { return {current_work.idx, 0, 0, -1}; }
++        return tile(params, current_work.idx + int(gridDim.x));
++    }
++
++};
++
++///////////////////////////////////////////////////////////////////////////////
++
+ template<int kBlockM, int kBlockN, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
+          bool Split=false, bool PackGQA=false, bool WarpSpecialized=true, bool LPT = false, bool Sort = false, bool Prepared = true>
+ class VarlenDynamicPersistentTileScheduler {

@@ -789,3 +789,828 @@ Open for other owners
   removal from elementwise.hpp. tests/s3: T1.2 XFAIL -> PASS under the amended rule.
 - tools/levref: S3 item 4 (a units fixture with non-unit gains; the GPU-made units fixture).
 - src/main.cpp (trainer stage): pass the dataset meta to `choose_plan`, `resolve` and `exec_shape` (S1 gap).
+
+## Decisions for S4-S6 (2026-10-25, from the H100 benches)
+
+Binding for the S4 (GEMM + FA3 attention), S5 (fused CE) and S6 (optimizer) builders. Numbers: `docs/bench/RESULTS.md`;
+reasons: DESIGN.md Appendix A part B and "Open decisions". A builder who cannot meet a bar reports it with the
+measurement; the bar does not move without a DESIGN.md change.
+
+All stages
+1. Determinism stays on by default (O5). Every kernel has a deterministic path with no float atomics; a faster
+   nondeterministic path may exist only behind `exec.deterministic=false`.
+2. Time every kernel bar below on H100 through devq (1 GPU, 5 warm-up and 20 timed calls, median, CUDA events) and
+   record the table in your BUILD_LOG section next to the bar.
+3. `resolve()` (config owner) maps `optim.ns_precision=auto` to `tf32` and `exec.ce_logits=auto` to `bf16`; parity
+   runs no longer refuse `auto` for want of T1.0.
+
+S4: GEMMs
+4. GemmCache searches cuBLASLt algorithms (deterministic split-K schemes only) and CUTLASS SM90 kernels per shape, as
+   DESIGN §3.7 says. Bar per shape and orientation: at least the better of cuBLAS and XLA in RESULTS.md §2 (e.g. fwd
+   M=131072 K=1024 N=3584: 760 TFLOP/s; fwd M=131072 K=512 N=128256: 671). Report every shape that misses it.
+5. Build with CUDA 12.8 and keep the 13.0 build green. Time cuBLASLt 12.8 against 13.0 on the RESULTS.md §2 shapes and
+   report it (input to O8).
+
+S4: attention
+6. FA3 (vendored `767386d`) is the backend. Build both fixed backward schedulers (`persistent`, `doc_causal`) with
+   deterministic on and off; never ship the padded non-persistent varlen grid in a training path (E6: +25-33%).
+7. Bar per scheduler, deterministic off, fwd+bwd per layer per 32 x 4096 tokens on the real segment rows: 130m 2.51 ms,
+   300m 3.75 ms, 520m 5.68 ms, 1.2B 9.21 ms (fwd 0.66 / 0.95 / 1.27 / 1.73 ms). Then run E1b and apply the O1 rule:
+   the faster scheduler summed over 130m, 520m, 1.2B; ties within 3% go to `doc_causal`.
+8. Do not build the C++ `CudnnSdpa` backend unless E1b's chosen FA3 sum exceeds 20.56 ms (cuDNN THD 19.58 ms x 1.05).
+   E1b times cuDNN with the existing Python bench. FA4 is not adopted (a tie).
+9. Before S7 depends on one step graph: a 4-GPU H100 test (one process, a thread per GPU, `ncclCommInitAll`) that
+   captures FA3 fwd+bwd and an NCCL reduce in one graph and replays it 100 times (E6's PyTorch graph arms crashed in
+   this setting).
+
+S5: fused CE
+10. Gradient in the forward; logits store bf16; dW accumulated in f32 across chunks and microbatches; lse and the
+    softmax statistics from the f32 accumulators. No recompute variant (dropped). The f32 store stays only as
+    `exec.ce_logits=f32`, the fallback if the bf16 store fails T1.5.
+11. Build B1 first, then B2, then B1.5; time all three at T = 16,384 and 131,072, D = 512 / 768 / 1024 / 2048,
+    V = 128,256. The stage per D is the fastest one that passes T1.5 (O2).
+12. Bar for B1 (Liger with f32 dW, the same structure): no slower than 13.57 ms per pls head (16,384 x 512 x 128,256)
+    and 109.0 / 145.2 / 179.3 / 320.0 ms at 131,072 rows, D = 512 / 768 / 1024 / 2048. Targets: B1 12.8 ms, B2
+    9.1-10.7 ms per pls head (GEMM floor 9.14 ms). The row kernel rewrites the store in place.
+13. T1.5 oracle rule against levanter's own error (CE dx 1.72e-3, dW 1.73-1.76e-3, per-token loss 6.2e-8 at 130m).
+
+S6: optimizer
+14. Newton-Schulz runs in TF32 (O3 decided). TF32 operands are rounded to nearest, as XLA's are: on the 512^3 f32 GEMM
+    probe, rel to the f64 product of TF32-RNE-rounded operands must be <= 1e-5 (levanter 1.2e-6 to 8.5e-6). 3xTF32 and
+    true f32 stay for the f32 policy and A/B tests.
+15. T1.6 and T1.7 use the oracle rule with levanter at HIGHEST as the oracle (levanter TF32 error 1.4e-4 to 1.0e-3).
+
+## S6: optimizer (2026-10-25)
+
+Built (src/kernels/optim and src/optim, one module `nm_optim`; the update kernels build with `--fmad=false` and spell
+every formula with `__fmul_rn` / `__fadd_rn` / `__fdiv_rn` / `__fsqrt_rn`; all portable: sm_90a + sm_80)
+- `src/optim/engine.hpp` `opt::Engine`: one rank's optimizer step from groups as data (`EngGroup`: rule, lr table, f64
+  b1 / b2 / eps / momentum / max_grad_norm / weight decay, clip group) and the tensors it owns (`EngTensor`: [rows,
+  cols] view, `base_row`, p32 / p16 / g / s0 / s1, lns grad and update scales, row partition, MuonH matrices with an
+  optional row map for fused buffers, owned row ranges, optional `u_out`). Phases, each graph-capturable after
+  `prepare()` (no allocation, no host sync, k read from device memory): `record_sumsq` (or per tensor:
+  `record_sumsq_tensor` + `record_clip_sums`, for the per-bucket schedule of DESIGN.md §4.1) -> all-reduce
+  `clip_sumsq` -> `record_update` (clip state, Adam, MuonH per NS chunk, AdamH pass 1) -> all-reduce `slot_pa` ->
+  `record_adamh_w` -> all-reduce `slot_w` -> `record_finish` (AdamH pass 3, optional k++). `record_step` runs them with
+  an all-reduce callback (skipped unless `sharded`). `baseline_groups(Config)` = muonh / adamh (main lr) / adam
+  (adam_lr), no weight decay; `group_dev` makes the f32 constants (optim.md §5.3 rule 1).
+- ZeRO-1 (DESIGN.md §6.1): `plan_ownership_specs(ParamSpec list, groups, ranks, zero1)` = every MuonH leaf matrix
+  whole on one rank, vocab-sized tensors row-split over all ranks, other tensors whole, LPT on estimated H100 seconds
+  (NS at 400 TFLOP/s + elementwise bytes at 3 TB/s); `zero1 = off` or 1 rank: owner -1 (everyone).
+  `engine_layout` turns specs + ownership into one rank's EngTensor list (leaf row ranges -> row maps).
+- Kernels (`src/kernels/optim/optim_dev.hpp`, internal): per-slice (16,384 floats) sums of squares in f64 of f32
+  squares, fixed-order segment sums (one f32 rounding at use), `k_clip_state` (`!(gn < max)`, `(g / gn) * max` applied
+  while reading g); Adam in one pass; AdamH in three (moments + ||p||^2, ||a||^2; ||w||^2; update); MuonH per 64 x 64
+  tile: Nesterov momentum into the NS buffer (wide orientation, shared-memory transpose for OUT > IN), `X / (||X|| +
+  1e-5)`, the three hyperball passes; float4 paths with a scalar fallback. Newton-Schulz batched by oriented shape
+  per chunk (`EngOptions::ns_chunk_bytes`, default 1 GiB of X, X', A, cA, B): `A = X X^T`; `cA = c * A` (f32
+  elementwise, as XLA's operand); `B = cA A + b A`; `X' = B X + a X` (b A and a X in the cuBLASLt epilogue, beta).
+  Two options, both off by default after the H100 bench: symmetric products (`EngOptions::ns_symmetric`; capi.h
+  `symmetric` bit 0): A and B are symmetric, so their GEMMs compute the blocks 11, 12, 22 of a 2 x 2 split (m1 = m / 2
+  rounded up to 32) and `k_ns_mirror` copies the transpose of block 12 into block 21 (3/4 of the X X^T and cA A
+  FLOPs; not with 3xTF32; m < 64 runs full); fold c (`ns_fold_c`; bit 1): `B = c (A A) + b A` with alpha = c, no cA
+  pass (the TF32 operand is A instead of c A).
+- `src/kernels/optim/ns_gemm.{hpp,cpp}` `NsGemm`: cuBLASLt strided-batched f32 GEMMs, TF32
+  (`CUBLAS_COMPUTE_32F_FAST_TF32`), true f32 (`_PEDANTIC`), 3xTF32 (operands split into tf32_rna(x) and the f32
+  remainder, small x big + big x small + big x big). Algorithm per shape: candidates without split-K (reduction scheme
+  NONE) from the heuristic of a fixed batch-2 layout, kept if valid for the real layout, first one or the fastest
+  (timed); `save()` / `load()` for a resumed run. The heuristic choice is a function of the matrix shape alone, so a
+  matrix runs the same kernel in any batch (gate: s6_nsalgo, review fixes below). (With per-batch heuristics, batch 1
+  picked split-K and batch 6 another tile; split-K validity depends on the batch through its workspace.) What training
+  needs, all ranks agreeing, comes from the all-reduced sums; 1 rank == 4 ranks bitwise (s6_zero1) holds on its data
+  but is not guaranteed in general: the f64 partials of row-split tensors add in another order, and the one f32
+  rounding of a sum can flip at a rounding boundary.
+- C ABI: capi.h `nm_newton_schulz`, `nm_muonh_update`, `nm_adamh_update`, `nm_adam_update` (one-tensor engines, test
+  path); `src/optim/capi_optim.h`: `nm_opt_create / set_tables / prepare / phase / step / buffers / destroy` (the engine
+  over a tensor list; sharded engines driven by phases) and `nm_ns_gemm` (the probe).
+
+Operation order. optim.md §3-§5, with one change read from the optimized HLO of levanter's 130m H100 train step
+(cache/levref/130m/t1_precision): XLA's algebraic simplifier rewrites the Adam direction `(mu / bc1) / (sqrt(nu / bc2)
++ eps)` into `mu / (bc1 * (sqrt(nu / bc2) + eps))` for lm_head's AdamH and every Adam leaf (a `multiply` with no jaxpr
+frame, `op_name="multiply.4x"`); the kernels compute that order (Adam updates moved closer to levanter: max rel 8.6e-8
+-> 8.4e-8 at 130m case A). The hyperball keeps `(w / ||w||) * n - p` (the HLO divides, then multiplies), the momentum
+`mu*buf + g` twice, the moments `(1-b)*x + b*m`, all without contraction; whether XLA's PTX contracts any of them is
+not known (no PTX in the dump); every tolerance below holds either way.
+
+Gates (della-vis1 A100-PCIE-40GB, shared: fresh full build, 0 warnings, `ctest -R s6_ -LE bench` 6 / 6 pass; H100:
+devq t49, t50, t52, t59, t61 on snapshots of the S6 build in bench/s6/snap, 1 GPU of a della H100 node; t61 = the
+final sources: every gate below passes there, T1.7 with the same 3 pass / 2 specfail; superseded by the review
+fixes below)
+
+| test | checks | A100 | H100 |
+|---|---|---|---|
+| s6_ownership | 130m and 1.2B fused layouts at 2 / 4 / 8 ranks: every row owned once, MuonH leaves whole, vocab tensors on every rank, LPT max/mean load <= 1.0028; zero1 = off; f32 constants as optim.md §5.3 bit patterns and == `optim_constants` | pass | pass |
+| s6_zero1 | 4 emulated sharded ranks (phases in lockstep, sums added between them) vs 1 rank on 130m shapes (2 layers, V 16,384, 64 MiB NS chunks): p, buf, mu, nu | bitwise | bitwise |
+| s6_graph | the step captured (global capture mode) and replayed 3 x == 3 eager steps (per-tensor clip sums in reverse order) | bitwise | bitwise |
+| s6_rowpart | frozen block (no update, no norm), lr-multiplier table, own AdamH norm scope vs a host f64 reference; scalar fallback vs float4 path | Adam within 0.25 of 1e-6 max(\|u\|, lr) + ulp; AdamH 7.5e-7; paths bitwise | pass |
+| s6_ns probe | 512^3 TF32 GEMM: rel to the f64 product of TF32-RNE / RNA / truncated operands | 7.6e-6 / 1.7e-6 / 8.7e-4 (A100 rounds RNA) | 1.2e-6 / 7.5e-6 / 8.7e-4 (H100 rounds RNE) |
+| s6_ns ns_ref | NS on random matrices (square, wide, tall, 100x37, 64x300, 33x65; batched) vs f64 | f32 <= 3.2e-6, 3xTF32 <= 4.1e-5, TF32 0.79-1.01 x the error of an f64 emulation with TF32-RNA operands; repeat bitwise | pass |
+| s6_ns t1_6 | T1.6, below | pass | pass |
+| s6_t1_7 | T1.7, below | 3 pass, 2 specfail (NOT PASSED) | 3 pass, 2 specfail (NOT PASSED) |
+
+T1.6 (levanter's u of update 0 per leaf; rule: rel(nano TF32, levanter HIGHEST) <= 1.25 x rel(levanter DEFAULT,
+HIGHEST)), H100:
+
+| leaf | levanter DEFAULT | nano TF32 (ratio) | nano 3xTF32 | nano f32 |
+|---|---|---|---|---|
+| 130m q / k / v / o (512 x 512) | 9.7e-4 / 1.0e-3 / 2.6e-4 / 3.5e-4 | 9.8e-4 (1.012) / 1.0e-3 (1.003) / 2.6e-4 (1.001) / 3.5e-4 (1.000) | 3.5e-6 .. 4.8e-6 | 2.1e-6 .. 6.6e-6 |
+| 130m gate / up (1792 x 512), down (512 x 1792) | 4.8e-4 / 4.4e-4 / 2.6e-4 | 0.994 / 1.001 / 1.004 | 7.1e-6 .. 7.8e-6 | 2.9e-6 .. 3.0e-6 |
+| 1_2b q, o (2048^2); k, v (1024 x 2048) | 5.9e-4, 1.4e-4; 8.2e-4, 1.6e-4 | 0.998, 1.000; 0.995, 0.998 | 8.6e-6 .. 1.6e-5 | 1.6e-6 .. 3.0e-6 |
+| 1_2b gate, up (7168 x 2048), down (2048 x 7168) | 2.1e-4, 1.8e-4, 1.4e-4 | 0.997, 0.996, 1.000 | 1.7e-5 .. 2.0e-5 | 1.5e-6 .. 3.2e-6 |
+
+TF32 passes at every leaf (ratio 0.994-1.012 H100, 0.997-1.032 A100). Two TF32 computations are independent samples
+of the same error, not near-copies: nano vs levanter DEFAULT is as far apart as either is from HIGHEST (the iteration
+amplifies single operand-rounding flips), so the ratio sits at 1, not below. True f32 holds the f32-dot bound (<= 6.6e-6
+<= 1e-5). 3xTF32 does not at 1_2b (1.6e-5 to 2.0e-5 on the H100; A100: 3.5e-5, and 1.2e-5 at 130m): its small parts
+are rounded to TF32 again and the tensor cores accumulate in f32 (probe: 1.2e-6 vs 4.1e-7 for true f32). By DESIGN.md
+§4.2 the f32 policy therefore uses true f32 (`optim.ns_precision = f32` -> `CUBLAS_COMPUTE_32F_PEDANTIC`); 3xTF32 stays
+an explicit A/B choice.
+
+T1.7 (one update on G0; cache/levref/<size>/step0_f32; case C inputs exported from the step-4958 checkpoint by
+tests/s6/export_case_c.py into cache/s6/caseC_in, all 16 parameters equal caseC/pin's sha256; params after the update
+rebuilt as f32(p_in + u) and checked against the fixture's sha256). H100 and A100 give the same numbers:
+
+| case | k, lr | group norms, clip | MuonH buf, mu, nu | Adam u | MuonH u: rel to HIGHEST (levanter DEFAULT) | AdamH u | norms kept | verdict |
+|---|---|---|---|---|---|---|---|---|
+| 130m A | 0, 0.02 | rel <= 6.5e-8, same clip | <= 1.2e-7 | <= 8.4e-8 | 2.4e-4..8.3e-4 (ratio <= 1.006) | 2.7e-6 | <= 9.0e-8 | pass |
+| 130m B | 1, 0.02 | bitwise, same | <= 7.5e-8 | <= 7.5e-8 | 2.4e-4..8.3e-4 (ratio <= 1.001) | 2.6e-6 | <= 8.6e-8 | pass |
+| 130m C | 4958, 5.04e-6 | bitwise, same | <= 8.5e-8 | <= 7.0e-8 | 1.1e-2..2.2e-2 (levanter 2.7e-3..8.5e-3) | 9.3e-3 | <= 8.3e-8 | specfail |
+| 300m A | 0, lr 0 | <= 1.1e-7, same | <= 3.3e-7 | 0 (exact) | (rounding noise at lr 0) | | <= 8.2e-11; params within 1 ulp | pass |
+| 300m B | 1, 1.0e-5 | <= 6.8e-8, same | <= 4.4e-8 | <= 7.1e-8 | 5.5e-3..7.7e-3 (levanter 1.2e-3..3.4e-3) | 3.3e-3 | <= 6.9e-8 | specfail |
+
+f32 policy (true-f32 NS) MuonH updates at 130m A / B: rel to HIGHEST <= 6.0e-6 (bound 1e-5). Two TF32 runs: bitwise.
+The symmetric-block option gives the same verdicts (item 15 ratio <= 1.004 at A / B; f64 ratio 0.97-1.00 at C, 300m B).
+
+Why C and 300m B miss item 15, and why that is not a defect of the port: at lr ~1e-5 the update `target - p` is about
+lr x |p| (5e-6 relative), while the f32 renormalization `(w / ||w||) * n` leaves about one f32 ulp of p per element
+(6e-8 relative), i.e. ~1 % of the update. Levanter's DEFAULT and HIGHEST programs share that rounding (same reduction
+order of n and ||w||), so their distance (the denominator of item 15) is only the TF32 part; marincpp's norms round
+independently. The test therefore also computes the spec's own oracle (kaiyue_baseline.md "Conventions": the whole
+update chain in f64 from the same f32 inputs and constants) and reports item 15 misses as SPECFAIL only where the oracle
+rule holds: rel(nano, f64) / rel(levanter, f64) for MuonH and AdamH updates is 0.71-0.97 (case C) and 0.61-1.09
+(300m B) with TF32, and the same with true f32 against levanter HIGHEST: marincpp is as close to the exact update as
+levanter or closer. At lr 0.02 (cases A, B) the same ratio is 0.995-1.005 for MuonH (TF32; true f32 vs levanter
+HIGHEST 0.82-1.09) and 1.10 / 1.35 for lm_head (AdamH; 3.1e-6 vs 2.3e-6 at case B: levanter's f32 sums of ||p||^2
+and ||w||^2 share one reduction order, so the rounding of n / ||w|| partly cancels; marincpp's correctly rounded
+norms do not; item 15 passes there).
+
+Bench (H100, `tests/s6/bench_s6.py`: one step on synthetic data in levanter's layout, median of 20 after 5 warm-up,
+CUDA events; "rank 0/4" = rank 0's ZeRO-1 share of 4 without the all-reduces; NS GEMM choice heuristic / timed)
+
+| size | TF32, one GPU holds all | TF32 rank 0/4 | TF32 symmetric rank 0/4 | true f32 rank 0/4 | DESIGN.md §4.2 budget (rank 0/4) |
+|---|---|---|---|---|---|
+| 130m | 5.22 / 4.53 | 1.55 / 1.38 | 1.84 / 1.68 | 2.70 |  |
+| 300m | 15.08 / 13.87 | 4.19 / 3.95 | 4.87 / 4.52 | 14.15 |  |
+| 520m | 48.91 / 43.06 | 12.58 / 11.24 | 14.04 / 11.77 | 47.21 |  |
+| 1_2b | 183.30 / 178.01 | 46.03 / 44.15 | 45.66 / 43.18 | 223.97 | 43 (TF32), 214 (true f32) |
+
+ms per step, heuristic / timed NS GEMM choice. 1.2B rank 0/4 with the defaults: 46.0 ms against the 43 ms budget
+(+7 %; the timed choice: 44.2 ms, +3 %); true f32 224 ms against 214 (+5 %). Where it goes (nsys, 1.2B rank 0/4,
+TF32): NS GEMMs 35.9 ms (cuBLASLt sm90 TF32 kernels, 10.7 TFLOP per step at ~300 TFLOP/s; the large shapes at ~390),
+MuonH elementwise 7.5 ms (momentum 1.9, hyperball 1.0 + 1.4 + 1.3, cA = c A 1.2, normalize 0.6), Adam / AdamH / clip
+sums 2.3 ms (at ~95 % of HBM bandwidth after the float4 paths; first version 48.9 ms in total: 64 x 64 tiles, a 2-D
+normalize grid without a 64-bit division per element and float4 paths took 3 ms off). The two NS options lose on the
+H100: symmetric blocks are slower at 130m-520m (130m rank 0/4: 1.85 vs 1.55 ms) and 1 % faster at 1.2B (the 1024 x
+1024 block GEMMs fill 1.45 waves of 132 SMs, against 5.8 for one 2048 x 2048 GEMM); folding c saves the 1.2 ms cA pass
+but T1.6's ratio rises to 1.01-1.11 (0.99-1.03 with the explicit cA operand), so both stay off.
+
+Requests (headers and docs outside src/optim, src/kernels/optim, tests/s6)
+1. optim.hpp `GroupSpec`: b1, b2, eps, momentum as double. f32 fields lose the decimal that rule 1 of optim.md §5.3
+   needs (`f32(1 - 0.9)` from the f64 difference is 0x3DCCCCCD; from f32(0.9) it is 0x3DCCCCD0). The engine keeps f64
+   (`EngGroup`).
+2. optim.hpp `plan_ownership`, `build_optimizer_plan`, `declare_optimizer`, `record_optimizer_step` take Model /
+   DeviceContext / MemoryPlan, which S7 builds. S6 implements the parts on `std::vector<ParamSpec>`
+   (`opt::plan_ownership_specs`, `opt::engine_layout`) and the step as `opt::Engine`; proposal: those four
+   declarations become thin S7 wrappers over the engine (or take `params()` directly).
+3. kernels/optim_kernels.hpp: its kernel list (MultiTensor, MuonMatrices, per-kernel launchers with ClipState) is not
+   what was built (src/kernels/optim/optim_dev.hpp: TensorTab / SliceTab / MatTab / RowPartTab, f64 partials, the
+   engine's phases). Proposal: reduce it to a pointer to src/optim/engine.hpp.
+4. capi.h: `nm_newton_schulz` needs `workspace = NULL` (it allocates); its `symmetric` argument carries two flags
+   (1: the 2 x 2 block form, 2: c folded into alpha); the block arrays of `nm_adamh_update` / `nm_adam_update` are
+   device pointers. capi_optim.h `nm_opt_create` takes the same options as `ns_precision` + 4 / + 8.
+5. optim.md §5.1 / §5.2 (and kaiyue_baseline.md Part 2): state the H100 program's `a = mu / (bc1 * (sqrt(nu / bc2) +
+   eps))` next to the jaxpr form.
+6. DESIGN.md §4.2 and O3 row: record T1.6's 3xTF32 result (outside 1e-5 at 1_2b on the H100) and that the f32 policy
+   runs true f32; `resolve()`: `optim.ns_precision = f32` means true f32 (3xtf32 an explicit value).
+7. kaiyue_baseline.md T1.7 row / decision item 15: at small lr the update is dominated by the f32 renormalization's
+   rounding, which levanter DEFAULT and HIGHEST share; proposal: MuonH and AdamH updates use the oracle rule against
+   the f64 oracle of the whole update chain (as the Conventions define it), with levanter DEFAULT (TF32) and levanter
+   HIGHEST (f32 policy) as "lev"; item 15's form stays as a report. Until then C and 300m B are NOT PASSED
+   (s6_t1_7_small_lr: SPECFAIL with both numbers, exit 1).
+
+Commands
+```bash
+ssh della-vis1; cd $ROOT/project/marin.cpp; module load gcc-toolset/14 cudatoolkit/12.8; export NANOMARIN_ROOT=$ROOT
+nice -n 19 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+  -DCMAKE_CUDA_HOST_COMPILER=g++ && nice -n 19 cmake --build build -j 8
+$ROOT/project/marin/.venv/bin/python tests/s6/export_case_c.py --src .     # once: T1.7 case C inputs (tensorstore)
+(cd build && nice -n 19 ctest -R 's6_' -LE bench --output-on-failure)
+python tests/s6/test_t1_7.py --lib build/libmarincpp_kernels.so --src . --only 130m_C --json out.json
+```
+
+Known gaps
+- Integration is S7's: reduce-to-owner and the bf16 all-gather (comm), the all-reduces between the phases (a callback
+  here), the per-clip-group start of DESIGN.md §4.1 (the phases are global; per-tensor clip sums exist), the metrics
+  ring and `step_advance`'s lr record, the memory plan entry for `Engine::workspace_bytes()`.
+- The MuonH tile kernels (momentum, hyperball) run at ~65 % of HBM bandwidth on the H100 (scalar 4-byte accesses
+  per thread, 32 x 32 sub-tiles with a shared-memory transpose); Adam, AdamH and the clip sums are at ~95 %.
+- Lazy (touched-row) Adam updates and decoupled weight decay: gated since the review fixes (baseline: neither); lazy
+  AdamH is refused.
+- XLA's FMA contraction inside the optimizer fusions is unverified (no PTX in the T1.0 dump).
+- T1.7 exists for 130m and 300m only (no 520m / 1_2b fixtures; spec).
+- A timed NS GEMM choice (`timed_gemm`) can differ per batch and so per rank; the default (heuristic, shape-only) is
+  rank-invariant; `save_gemm_algos()` keeps either across a resume.
+
+## S6 review fixes (2026-10-25)
+
+Blocking findings (both real; fixed)
+1. C ABI constants (optim.md §5.3 rule 1). capi.h passes b1 / b2 / eps (and MuonH mu) as float; `nm_adam_update` /
+   `nm_adamh_update` stored double(f32(0.9)), so `group_dev` made f32(1 - 0.89999997615814209) = 0x3DCCCCD0 and
+   0x3CA3D700 instead of 0x3DCCCCCD / 0x3CA3D70A (one step at g = 0.5: mu 0x3d4cccd0, nu 0x3ba3d700). Fix:
+   `decimal_of` (src/optim/capi_optim.cpp) recovers the decimal of each f32 argument (shortest round-trip digits by
+   `std::to_chars`, then `strtod`) before the engine forms 1 - b. Gate s6_rowpart.capi_one_tensor_bits: one step of
+   each one-tensor entry point; mu / nu bits 0x3d4ccccd / 0x3ba3d70a, Adam's p bitwise against host f32 in the kernels'
+   order, the MuonH buffer bitwise, AdamH and MuonH norms kept to 1e-6. Mutation (no `decimal_of`): the case fails with
+   the reviewer's bits.
+2. Rank-invariance gate. New s6_nsalgo: every oriented NS shape of the four sizes (10 shapes), TF32 and true f32, full
+   and symmetric products, planned at batch 1, 2, 3, 6 and the engine's 1 GiB chunk capacity: the chosen cuBLASLt
+   algorithm configuration of every GEMM of the iteration equals batch 1's, reduction scheme NONE (new
+   `NsGemm::algo_config`: the nine CUBLASLT_ALGO_CONFIG_* attributes, kernel id, tile, stages, split-K, reduction,
+   swizzle, custom option, inner shape, cluster shape; `reduction_scheme`; `batch_fallback`). 200 plans, 0 fallbacks
+   to the per-layout heuristic, on the A100 and the H100. Mutation (`make_layouts(e->d, e->d.batch, two)`): fails on
+   the A100 (e.g. 1_2b 1024 x 2048: every batch other than 1 picks another configuration), where s6_zero1 and s6_ns
+   still passed. A first version compared the opaque algorithm bytes, as the review proposed; it failed on the H100
+   (t76: 130m 512 x 512 TF32, batch 1 vs 2 / 3 / 6 / 204) with the same configuration: on the H100 the first heuristic
+   call of a process leaves non-zero garbage in bits 16..31 of algo.data[4], outside every configuration attribute
+   (bench/s6/dbg, t77 / t78: three processes, same kernel, word 0x0001d845bf330001 in the first call and
+   0x0001d84500000001 after). The bytes are not a rank-invariant key; the configuration is.
+
+Minor findings
+3. T1.7 at small lr: the binding rule decides the exit code. s6_t1_7 (130m A, B; 300m A) passes; the new ctest
+   s6_t1_7_small_lr (130m C, 300m B) prints SPECFAIL with both numbers and exits 1 until the owner rules on request 7.
+   (S3's T1.2 prints NOT PASSED with exit 0; here the ctest status itself shows the failure, so `ctest -R s6_ -LE bench`
+   is 8 / 9 by design.) Case C is mandatory when the 130m fixture exists (a missing caseC directory is a FAIL, no
+   longer a SKIP): case A has little power against momentum-form bugs (buf = 0), B and C carry it.
+4. One bias-correction table pair: the engine refuses Adam / AdamH groups whose b1 / b2 differ (s6_rowpart.refusals).
+5. Table bounds: `optk::Tables::n_steps`; `Engine::set_tables` and `nm_opt_set_tables` take N. Every kernel that reads
+   k (`cur_step`, `k_step_advance`) traps when k is outside [0, N), so the stream reports a launch failure instead of
+   reading past the lr and bias-correction tables (one compare per thread). Gate s6_bounds: a step at k = N - 1 runs
+   and advances k to N; the next step fails with cudaErrorLaunchFailure.
+6. Lazy AdamH is refused (the whole-tensor norms are not defined over touched rows only). Lazy Adam rows and decoupled
+   weight decay now have a gate: s6_rowpart.lazy_adam_weight_decay (untouched rows keep p, mu, nu bitwise; touched rows
+   bitwise equal to host f32 with a = mu / (bc1 (sqrt(nu / bc2) + eps)) + wd p, u = (-lr) a).
+7. MuonH edge tiles in the engine path: s6_rowpart.muonh_edge_tiles, [2 x 100, 37] (OUT > IN: transposed NS
+   orientation) and [2 x 33, 65], true-f32 NS: buffer bitwise against host f32, update rel to an f64 reference of the
+   whole chain 2.6e-6 .. 3.3e-6 (bound 2e-5), every element written (u_out pre-filled with NaN). Mutations: dropping the
+   last partial column sub-tile of the non-transposed X load (rel 5.9) or the last partial row of the transposed X
+   store (rel 9.4) both fail.
+8. s6_zero1 wording (S6 section above): 1 rank == 4 ranks bitwise holds on its data, not in general.
+9. bench_s6.py: the ZeRO-1 rows used a round-robin split. Each rank's share now comes from the LPT rule of
+   `plan_ownership_specs` (same units, costs and parameter order; per-layer gains as separate units); every rank is
+   timed; the row reports the slowest rank (the step waits for it) and rank 0.
+10. T1.7 on the shared A100: `retry_oom` (tests/s6/s6lib.py) retries a Run or the f64 oracle after a CUDA
+    out-of-memory error (8 tries, 60 s apart); other errors and the last OOM propagate.
+11. H100 rerun from the integrated full build (S4, S5 and S6 modules in one library): devq t76, below.
+Also: s6_ownership's 1.2B layout had 28 layers; the preset has 16 (fixed; balance unchanged, max / mean <= 1.0028).
+
+Not changed: the Adam order (the H100 HLO is the only evidence; T1.7 cannot tell the two orders apart, 8.4e-8 vs
+8.6e-8); the 1.2B budget miss (no kernel change in this pass; H100 numbers below); the "verified correct" items.
+
+Gates (della-vis1 A100-PCIE-40GB, shared; incremental build of the full tree with the fixes, -Werror, 0 warnings)
+
+| test | A100 |
+|---|---|
+| s6_ownership | pass (max / mean load <= 1.0028 at 2 / 4 / 8 ranks) |
+| s6_zero1, s6_graph | pass (bitwise) |
+| s6_rowpart (6 cases: + muonh_edge_tiles, capi_one_tensor_bits, lazy_adam_weight_decay, refusals) | pass |
+| s6_nsalgo | pass (200 plans, 0 fallbacks) |
+| s6_bounds | pass |
+| s6_ns | pass |
+| s6_t1_7 (130m A, B; 300m A) | pass |
+| s6_t1_7_small_lr (130m C, 300m B) | SPECFAIL (exit 1): MuonH item 15 ratio <= 6.39, f64 oracle ratio <= 0.974 (C) and <= 1.090 (300m B) |
+
+H100 (devq, 1 GPU of a della H100 node; snapshots of the integrated build): t76 (bench/s6/snap/v6) ran every gate;
+all pass except s6_nsalgo's byte comparison (item 2), and s6_t1_7_small_lr is SPECFAIL as on the A100. t79
+(bench/s6/snap/v7: the configuration comparison) reran every gate: rc 0, every gate passes, s6_t1_7_small_lr
+SPECFAIL with the same numbers; bench within 1 % of t76 (1_2b TF32 4 ranks: 46.50 / 44.82 ms).
+
+| test | H100 (t76 unless noted) |
+|---|---|
+| s6_ownership, s6_zero1, s6_graph, s6_bounds | pass |
+| s6_rowpart | pass: edge tiles rel 2.5e-6 .. 3.3e-6; C ABI mu / nu bits 0x3d4ccccd / 0x3ba3d70a; lazy Adam + decay bitwise |
+| s6_nsalgo | t76 FAIL (bytes, item 2); t79 pass (configurations: 200 plans, 0 fallbacks) |
+| s6_ns | pass (probe, ns_ref, T1.6 130m, T1.6 1_2b) |
+| s6_t1_7 | pass: 130m A (MuonH ratio <= 1.006, Adam 8.4e-8, f32 policy 6.0e-6), 130m B (ratio <= 1.001), 300m A (<= 1 ulp) |
+| s6_t1_7_small_lr | SPECFAIL: MuonH item 15 ratio <= 6.39; f64 oracle ratio <= 0.974 (130m C), <= 1.090 (300m B) |
+
+Bench (H100, t76; ZeRO-1 rows: every rank of the LPT plan timed, the slowest reported; ms per step, NS GEMM choice
+heuristic / timed)
+
+| size | TF32, one GPU holds all | TF32, 4 ranks (slowest) | TF32 symmetric, 4 ranks | true f32, 4 ranks | DESIGN.md §4.2 budget |
+|---|---|---|---|---|---|
+| 130m | 5.20 / 4.53 | 1.63 / 1.50 | 1.92 / 1.77 | 3.23 | |
+| 300m | 15.15 / 13.96 | 4.21 / 3.93 | 4.88 / 4.51 | 14.09 | |
+| 520m | 49.15 / 43.66 | 12.99 / 11.20 | 14.13 / 11.77 | 47.18 | |
+| 1_2b | 183.59 / 180.06 | 46.36 / 44.72 | 45.59 / 43.54 | 224.24 | 43 (TF32), 214 (true f32) |
+
+The slowest planned share is 0.5-5 % above the round-robin rank 0 of the S6 table (1_2b TF32: 46.36 vs 46.03 ms). The
+1_2b miss stands: TF32 +7.8 % (timed choice +4.0 %), true f32 +4.8 %; within DESIGN.md §12.3's 1.25 x row rule.
+
+## S4: GEMM layer and attention (2026-10-25)
+
+Built
+- GEMM layer (src/kernels/gemm). `GemmCache` (gemm.hpp): `plan()` records a `GemmDesc`, `choose_all()` times every
+  deterministic candidate per shape and keeps the fastest. Candidates: cuBLASLt's heuristic algorithms (up to 24) and
+  each of them with split-K 2-16 under every allowed reduction scheme (bf16 D: NONE and COMPUTE_TYPE only, so a split
+  result is reduced in f32 and rounded once; f32 D: also INPLACE and OUTPUT_TYPE); the same set again on a transposed B
+  (`ltT:`, for op_b N: the weight is transposed into the workspace inside the timed call, then a K-major GEMM); and 16
+  CUTLASS SM90 kernels registered at static init (`gemm_sm90_*.cu`: fwd, dgrad, wgrad, Levanter wgrad x {128x256
+  cooperative cluster 2x1, 256x128 cooperative, 128x128 ping-pong, 128x256 stream-K with the deterministic fixup}; the
+  Levanter wgrad epilogue `D = C + f32(bf16(acc))` is an epilogue visitor tree, no transient). Timing: all candidates 2
+  warm-up + 5 timed calls (median, CUDA events), the 4 fastest again 5 + 20; a custom kernel wins only when > 1% faster
+  than the best cuBLASLt one (O9). Candidates that fail to launch are dropped. The workspace is the largest the chosen
+  algorithms need plus the transients. `save()` writes `gemm_algos.bin` (key = desc + GPU name + SM count + cuBLASLt
+  version -> kernel name, `.tmp` then rename); a later `choose_all` with that file executes the saved kernels (bitwise
+  resume). Portable Levanter wgrad path: cuBLASLt writes bf16(acc) to a transient, `bf16_round_add` adds it to the f32
+  gradient. `linear_{fwd,dgrad,wgrad}_desc`. Fused epilogues other than Bf16RoundAddF32 are refused (S8).
+- C ABI: `nm_linear_fwd/dgrad/wgrad`, `nm_gemm_f32` (TF32 and pedantic f32; 3xTF32 refused), and
+  src/kernels/gemm/capi_gemm.h (`nm_gemm_search` -> JSON report, `nm_gemm_chosen`, `nm_gemm_custom_*`,
+  `nm_linear_custom`). The C ABI searches a shape on its first use.
+- FA3 (third_party/fa3-hopper): the 31 sources of `hopper/` at `767386d` that the sm90 launch templates include, the
+  LICENSE, and the marincpp patches (README.md there; `marincpp.patch` = the whole diff; it was stale until the
+  review fixes below regenerated and verified it). CUTLASS stays a git checkout at `7127592`; `.gitmodules` declares it as the submodule
+  `third_party/cutlass` (the controller adds it with `git submodule add`; the checkout is a blob-less clone). Patches:
+  doc-causal masking on FA3's `Is_local` kernels (per-position segment start / end tables bound the n / m loops and
+  the masks); a device work-list backward scheduler (`NmBwdListScheduler`; pre/postprocess over list tiles); the
+  commented-out KVEmpty handoff enabled for persistent backward CTAs; descending deterministic dQ order over exactly
+  the visiting n blocks for doc-causal (upstream local pads over the whole row); GQA first-head store in deterministic
+  mode (no dK/dV accumulator memsets); [H, T] LSE in batch mode; errors throw instead of `exit(1)`.
+- src/kernels/attention: `fa3_backend.cu` (torch-free parameter fill replacing flash_api.cpp, workspace layout, the
+  in-graph kernels `k_bwd_worklists` and `k_doc_tables`), 17 instantiation units (`fa3_inst_*.cu`: fwd hd64 varlen /
+  varlen PackGQA / doc, hd128 varlen PackGQA / doc; bwd {hd64 MHA+GQA, hd128 GQA} x {stock, list, doc} x
+  deterministic on/off), FA3's `flash_prepare_scheduler.cu`. Modes (attn_internal.hpp): `doc_causal` and
+  `persistent` (= the work list on a grid of one CTA per list slot, `ListGrid`), and the E1b arms `ListPersistent`
+  (grid = SM count, static striding), `StockPadded`, `StockExact`. Every workspace buffer is caller memory; required
+  zeroing is a memset node (GQA dK/dV semaphores; accumulators only when deterministic is off); the forward and the
+  backward of one shape share one training workspace. `AttnBwdArgs::softmax_d` and `dq_accum` (S8 fusions) are refused.
+- Reference attention (`ref_attention.cu`, sm_80 and sm_90a): the RefF32 backend and the oracle of the FA3 gates.
+  Causal same-segment softmax, f32 math and statistics over 1024-key blocks in ascending order, bf16 or f32 storage,
+  segments from cu_seqlens or row_seg_start, every output element one warp's fixed-order sum (no atomics). `make_attention`
+  builds FA3 and RefF32; LevRef and CudnnSdpa are refused with the reason.
+- C ABI: `nm_attention_workspace_bytes/fwd/bwd` (capi.h) and src/kernels/attention/capi_attn.h (`nm_fa3_mode_*` for
+  every mode, `nm_ref_attention_fwd/bwd` with explicit storage).
+
+Gates
+
+| gate | where | result |
+|---|---|---|
+| build, CUDA 12.8 (gcc 14, -Werror, sm_90a + sm_80) | della-vis1 | every target, 0 warnings (CUTLASS as a SYSTEM include: its sm100 collective headers warn under C++20) |
+| build, CUDA 13.0 | della-vis1 | every S4 object library and nm_bench_s4_gemm: 0 warnings. The full link stops at S5's `ce_sm90.cu` (`cudaGetDriverEntryPoint` is deprecated in 13.0, -Werror) |
+| s4_attention: reference vs f64 (synthetic rows with length-1 segments and tile-edge ends; 130m, 300m, 520m GQA, 1.2B hd128) | A100, H100 | f32 storage rel <= 5.5e-7 (bound 1e-6); bf16 storage O at 1.000x the single-rounding floor, dq / dk 1.14-1.18x, dv 1.00x (bounds 1.05 / 1.25), L rel <= 3.5e-8; bitwise repeatable; cu_seqlens and row_seg_start tables give the same bits |
+| s4_attention: every FA3 mode, deterministic off and on, vs the reference in f32 storage, at 130m / 300m / 520m / 1.2B on the 32 real segment rows (bench/e1_attention/segments; 166 segments, longest 4096), on 2 synthetic edge-case rows per shape, and on rows with 24 segments each | H100 | every O / dq / dk / dv within 1.59x the bf16 floor (bound 2.5; E1 measured 1.2-1.9x), L rel <= 1e-5, rows within 10x; deterministic mode bitwise repeatable in all 50 checks; persistent and list_grid bitwise equal (same order) |
+| s4_t1_4 (T1.4, oracle rule, levanter fixtures 130m / 520m / 1_2b, both roundings) | A100 (reference), H100 (all) | pass; rel(nano, f64) / rel(levanter, f64), worst over sizes: reference O 0.52, dq 0.23, dk 0.24, dv 0.22, L 0.03; FA3 (persistent and doc_causal, det on and off) O 0.57, dq 0.26, dk 0.28, dv 0.27, L 0.03 (bound 1.25) |
+| s4_gemm: linear fwd / dgrad vs f64 (owner layers, T 8192, lm head T 2048) | A100, H100 | 1.000x the single-rounding floor (bound 1.05); two calls bitwise equal |
+| s4_gemm: wgrad accurate (T 16,384, beta = 1 in place) | A100, H100 | rel(D - C, f64) <= 2.4e-5 (bound 1e-4: tensor-core f32 accumulation); bitwise repeatable |
+| s4_gemm: wgrad Levanter | A100, H100 | D(0) bf16-valued, 1.00x floor; D(C) == C + D(0) bitwise |
+| s4_gemm: every CUTLASS kernel on every orientation it takes | H100 | all pass the same bounds; stream-K deterministic: bitwise repeatable |
+| s4_gemm: nm_gemm_f32 | A100, H100 | pedantic rel <= 3.5e-7, TF32 2.9e-4 |
+| s4_graph_nccl (decision 9): 4 H100, one process, a thread per GPU, ncclCommInitAll; FA3 fwd + bwd of both training schedulers (deterministic, 520m GQA shape, 32k tokens per GPU) + an NCCL all-reduce in one graph | H100 (devq t42; final code devq t56) | 22-node graph per rank, 100 replays, every checkpoint bitwise equal to the eager run on all 4 ranks, both runs |
+
+E1b (decisions 6-8, O1): fwd+bwd per layer per 32 x 4096 tokens on the real segment rows, ms (median of 20, CUDA
+events, 1 H100, devq t63, `tests/s4/bench_attention.py`); E1 bar = FA3 varlen of E1 with the real `cu_seqlens`
+(deterministic off).
+
+| shape | E1 bar | stock_exact det 0 / 1 | stock_padded 0 / 1 | persistent (SM grid) 0 / 1 | list_grid 0 / 1 | doc_causal 0 / 1 |
+|---|---|---|---|---|---|---|
+| 130m | 2.51 | 2.45 / 2.61 | 3.65 / 3.71 | 3.11 / 3.27 | 2.55 / 2.63 | **2.37 / 2.46** |
+| 300m | 3.75 | 3.78 / 3.91 | 5.43 / 5.49 | 4.64 / 4.86 | 3.79 / 3.91 | **3.63 / 3.70** |
+| 520m | 5.68 | 5.64 / 6.10 | 8.24 / 8.63 | 7.71 / 6.85 | 5.79 / 5.70 | **5.36 / 5.42** |
+| 1.2B | 9.21 | 9.46 / 10.24 | 12.33 / 13.27 | 14.44 / 11.22 | 9.59 / 9.49 | **9.05 / 9.17** |
+| 300m S 4224 | 3.72 | 3.73 / 3.92 | 5.47 / 5.57 | 5.03 / 4.78 | 3.81 / 3.90 | 3.58 / 3.48 |
+| 300m S 4480 | 4.71 | 4.80 / 4.83 | 6.57 / 6.69 | 5.61 / 6.36 | 4.87 / 5.12 | 4.96 / 4.93 |
+| sum 130m + 520m + 1.2B | 17.40 | 17.56 / 18.94 | 24.22 / 25.61 | 25.26 / 21.33 | 17.93 / 17.82 | **16.78 / 17.06** |
+
+Forward (ms, doc_causal / list modes): 130m 0.68 / 0.62, 300m 1.00 / 0.92, 520m 1.31 / 1.22, 1.2B 1.72 / 1.75 (bar
+0.66 / 0.95 / 1.27 / 1.73). Full table with the error of every arm: bench/s4/results/v5-e1b/e1b_summary.md.
+- O1 rule: doc_causal (16.78 ms against list_grid 17.93 and the SM-count grid 25.26, deterministic off; 17.06 against
+  17.82 and 21.33 on). doc_causal meets the bar at every 4096-token shape with deterministic off (0.94-0.98) and on
+  (0.95-1.00); its deterministic cost is +1.7% (FA3's own varlen backward: +8%). cuDNN (decision 8): not built, the
+  chosen FA3 sum 16.78 ms is far below 20.56 ms. Request: resolve `exec.attn_bwd_sched=auto` to `doc_causal`.
+- The padded version-1 grid costs +39% (24.22 vs 17.40), E6's finding. The work list (list_grid) removes it (+3%
+  over E1); the SM-count grid with static striding is 1.2-1.6x slower than the same list on a full grid (no dynamic
+  load balance), so `persistent` runs the full-grid list.
+- What moved the numbers (earlier E1b runs, bench/s4/results/v3-e1b, v4-e1b): ascending deterministic dQ order cost
+  2.2-2.5x (doc_causal) and 1.4x (list) because every n block then waits for its predecessor's dQ write at every m
+  block; descending order (FA3's causal order: the higher n blocks reach an m block first) removed it. Ordering the
+  work list head-innermost cost 1.3-1.6x (poor L2 reuse of Q / dO); segment, then head, then n fixed it.
+- Misses: doc_causal at S 4480 (4.96 vs 4.71, +5%; its forward 1.37 vs 1.23: 4480 is not a multiple of the 192-row
+  forward tile); list_grid +1-4% at the 4096 shapes. S 19456 (pls bytes) was not run: its segment file is the bytes
+  tokenizer's, which the bench does not load yet.
+
+GEMM search (decision 4; bench/s4/results/gemm_combined.md): `nm_bench_s4_gemm --set all` on 1 H100 in three runs
+(devq t41, t55, t64), TFLOP/s of the chosen kernel (search median, and a second timing through `GemmCache::run`).
+The same shape differs by up to 8% between runs on the shared node, so the table takes the best of the three. 29 of the
+44 E1 shape-orientations reach the bar (best of cuBLAS default and XLA, RESULTS.md §2).
+
+| M x K x N | fwd | dgrad | wgrad | wgrad Levanter |
+|---|---|---|---|---|
+| 131072 x 512 x 1536 | 751 / 606 | 760 / 707 | 751 / 728 | 737 / 728 |
+| 131072 x 512 x 1792 | 753 / 645 | 718 / 715 | 717 / 712 | **707 / 712** |
+| 131072 x 768 x 2304 | 794 / 692 | 771 / 754 | 712 / 671 | 708 / 671 |
+| 131072 x 768 x 2688 | 772 / 690 | **737 / 760** | 749 / 712 | 768 / 712 |
+| 131072 x 1024 x 3584 | 769 / 760 | **717 / 756** | 728 / 718 | 750 / 718 |
+| 131072 x 2048 x 7168 | **712 / 733** | 740 / 733 | 714 / 700 | 710 / 700 |
+| 131072 x 512 x 128256 | **658 / 671** | 691 / 685 | 706 / 696 | 698 / 696 |
+| 131072 x 768 x 128256 | 684 / 668 | **699 / 723** | 712 / 709 | 713 / 709 |
+| 16384 x 512 x 128256 | 718 / 692 | **691 / 724** | **703 / 704** | **691 / 704** |
+| 16384 x 768 x 128256 | 690 / 665 | **736 / 740** | **693 / 708** | **694 / 708** |
+| 8192 x 768 x 128256 | 747 / 743 | **712 / 759** | **670 / 778** | **698 / 778** |
+
+(chosen / bar; bold = below the bar.) Trunk misses: dgrad K 1024 N 3584 0.948, dgrad K 768 N 2688 0.970, fwd K 2048
+N 7168 0.971, Levanter wgrad K 512 N 1792 0.994. The other 11 misses are LM-head shapes (S5's CE uses its own GEMMs).
+Chosen kernels: cuBLASLt algorithm 66 (sm90) with various tiles and split-K (COMPUTE_TYPE) for the small-output
+wgrads, CUTLASS stream-K for some wgrads and the Levanter wgrad at K 768-1024, CUTLASS cooperative for dgrad K 2048.
+The transposed-B dgrad variant never won. Per-shape candidates: 12 (bf16 out) to 65 (f32 out with split-K).
+- O8 (decision 5): cuBLASLt 13.0 / 12.8, best of three runs each, over the 44 E1 shape-orientations: median 0.976,
+  0.90-1.02. 13.x is not faster by > 3%: stay on 12.8.
+
+Commands
+```bash
+ssh della-vis1; cd $ROOT/project/marin.cpp; module load gcc-toolset/14 cudatoolkit/12.8; export NANOMARIN_ROOT=$ROOT
+nice -n 19 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+  -DCMAKE_CUDA_HOST_COMPILER=g++
+nice -n 19 cmake --build build -j 14 && (cd build && nice -n 19 ctest -R 's4_' --output-on-failure)
+# H100 (devq): snapshot the build (lib, nm_bench_s4_gemm for 12.8 and 13.0, nm_test_s4_graph_nccl, tests/s4, tests/s3/nmk.py)
+# into bench/s4/snap/<v>/ with bench/s4/snap/v1/task.sh, then
+python3 tools/devq/devq.py submit --gpus 1 --arch h100 --name s4-tests --cwd <snap> -- bash <snap>/task.sh tests  # e1b, gemm
+python3 tools/devq/devq.py submit --gpus 4 --arch h100 --name s4-graph --cwd <snap> -- bash <snap>/task.sh graph
+python3 tests/s4/gemm_report.py bench/s4/results/<v>-gemm/gemm_cu128.jsonl bench/s4/results/<v>-gemm/gemm_cu130.jsonl
+```
+
+For other owners (S4 does not edit them)
+1. config (`resolve`, config.hpp `AttnBwdSched`): `exec.attn_bwd_sched=auto` -> `doc_causal` (O1 decided above).
+2. DESIGN.md §3.4 / O1 / attention.hpp: `persistent` is the device work list on a grid of one CTA per list slot (the
+   SM-count grid measured 1.2-1.6x slower); O1 decided: doc_causal. The FA3 deterministic cost in §11 / §12.2b
+   (x1.14) is x1.017 for doc_causal.
+3. attention.hpp `AttnBwdArgs::dq_accum` and S3's `k_dq_post_qknorm_rope_bwd` (DESIGN §3.1 B3): FA3's dQ accumulator
+   is not row-major [H, T, hd]: each kBlockM x hd tile is stored in the dQ MMA's fragment order (FA3's postprocess
+   reads it through TiledMmadQ). The S8 fusion must read that layout (or FA3 must store rows); until then the backend
+   refuses `dq_accum` and writes dq. `softmax_d` input likewise refused until S8 also writes lse_log2.
+4. gemm.hpp: `GemmCache` has no destructor and no report accessor; S4 keeps the search reports and chosen names in
+   a side table (`gemm::report`, `gemm::chosen_name` in gemm_internal.hpp). Request: `~GemmCache()`, non-copyable,
+   `std::vector<ShapeReport> report() const`.
+5. S5 (`ce_sm90.cu`): `cudaGetDriverEntryPoint` is deprecated in CUDA 13.0 (`cudaGetDriverEntryPointByVersion`),
+   which breaks the 13.0 build under -Werror.
+6. S6: `nm_gemm_f32` (capi.h GEMM block) is S4's; it does not prove TF32 rounding to nearest (decision 14 is S6's
+   T1.6 probe).
+
+Known gaps
+- LevRef (levanter's bf16 running statistics, the strict preset's attention) is not built. Levanter's jaxpr
+  (flash_attention.py) rounds attn, max, P, the running sums and o to bf16 at each 1024-key block, and its backward
+  mixes an f32 P with bf16 dP / D; XLA:GPU on the A100 dropped bf16 rounding points inside fusions (S3 finding), so a
+  bit-faithful port needs the H100 HLO first. T1.4 passes with FA3 and the reference.
+- 3xTF32 GEMMs and upper-triangle-only (`symmetric_output`) tiles are not built (NS: S6 uses its own path);
+  `symmetric_output` computes the full product.
+- The work list's SM-count grid (`ListPersistent`) has no dynamic load balance (1.2-1.6x slower); kept as an E1b arm.
+- GQA accumulators in deterministic-off mode are still zeroed by memsets each call (FA3's order is not fixed there).
+- GEMM bars: 15 of 44 shape-orientations below on the best of three runs (above); the run-to-run spread (up to 8%) is
+  as large as most gaps. A CUTLASS dgrad tuned for N-major B, or more cuBLASLt configurations than the heuristic
+  returns (tile / stage enumeration), are the next candidates.
+- E1b at S 19456 (pls bytes) not run.
+
+## S4 review fixes (2026-10-25)
+
+Blocking findings (all three real; fixed)
+1. FA3 deterministic hand-off. The dQ writer (`store_dq`) and the GQA dK / dV epilogue released the semaphore after
+   `tma_store_wait` (`cp.async.bulk.wait_group.read`: the shared-memory reads are done, not the global add), so the
+   next writer's bulk add to the same tile was not ordered by the PTX memory model. Fix (`SM90_BULK_HANDOFF`,
+   third_party/fa3-hopper/copy_sm90_bulk_reduce.hpp; deterministic instantiations only): each writer runs
+   `cp.async.bulk.wait_group 0` + `fence.proxy.async.global` before `arrive_inc`; the next writer runs
+   `fence.proxy.async.global` after its acquire, before its bulk add or store. Covers dQ (doc-causal, work list, stock)
+   and every non-first GQA head (G >= 3 included). Cost, E1b v7 (below): doc_causal deterministic +2.6% summed
+   (16.46 -> 16.88 ms; it was +1.7% before the fix).
+2. GEMM gate covers every candidate. New C ABI (capi_gemm.h): `nm_gemm_candidates` (every candidate of one search that
+   launched, fastest first) and `nm_linear_named` (one call of a named candidate through the cache's own code path;
+   `gemm::force_choice`). New case s4_gemm.every_candidate: every candidate of every owner layer (11) and orientation
+   (fwd, dgrad, wgrad accurate, wgrad levanter), two calls bitwise equal, the same bounds; wgrad on a random nonzero C
+   (accurate rel(D - C, f64) <= 1e-4; levanter D(0) bf16-valued, D(0) <= 1.05x floor, D(C) == C + D(0) bitwise). H100:
+   3,532 candidates, 0 failing (fwd / dgrad <= 1.004x floor, wgrad accurate <= 1.86e-5). A100 (one layer per size +
+   head): 1,294 candidates, 0 failing. Mutation (the reviewer's: `transpose_bf16` skips the last k row): the old
+   linear_fwd_dgrad still passes; every_candidate fails 604 checks (every `ltT:` candidate, dgrad up to 22x floor,
+   wgrad rel 7.9e-3).
+3. custom_kernels runs every CUTLASS wgrad on a random nonzero C (in place, beta = 1): accurate rel(D - C, f64) <= 1.9e-5;
+   Levanter D(C) == C + D(0) bitwise for all 22 kernel x shape pairs (H100, devq t83).
+
+Minor findings
+4. `marincpp.patch` regenerated (`diff -ru` against upstream `767386d` extracted with `git show`, equal to the
+   reviewer's copy); `patch -p1` on upstream reproduces all 31 vendored files. README.md states the check.
+5. doc_causal forward at hd 64 = the varlen forward (`fwd_varlen`, fa3_backend.cu): it writes O [T, H*hd] and lse
+   [H, T], the layout the doc backward reads; hd 128 keeps the doc forward (faster there). doc_causal now needs
+   cu_seqlens at hd 64 (k_doc_meta writes both tables). Forward, ms, E1b v7: 130m 0.62, 300m 0.91, 520m 1.22, 1.2B 1.72
+   (bars 0.66 / 0.95 / 1.27 / 1.73): every bar met; S 4480 fwd+bwd 4.37 (bar 4.71, was 4.96).
+6. Production dispatch tested. fa3_owner_shapes and the new fa3_gqa_group4 run `nm_attention_workspace_bytes / fwd /
+   bwd` (make_attention, fa3::fwd / bwd, fa3_mode_of) for both schedulers: deterministic on, bitwise equal to the mode
+   it must run (12 of 12); off, within the FA3 bounds. production_ref_f32: ref_f32 through make_attention ==
+   nm_ref_attention_* bitwise (A100 and H100). T1.4 calls FA3 through nm_attention_*. Test mode names now match the
+   training knob: `persistent` = ListGrid (what exec.attn_bwd_sched=persistent runs), `sm_grid` = ListPersistent (the
+   E1b arm); the old T1.4 / gate rows labelled "persistent" ran the SM-count grid.
+7. test_graph_nccl: each scheduler writes its own O / LSE / dQ / dK / dV and all-reduced dK (23 graph nodes per rank);
+   100 replays bitwise equal to the eager run on 4 ranks for both (devq t82).
+8. GemmCache: candidate names carry every config attribute read with its own type (`:is` inner shape added; the
+   uint16 cluster id had been read as uint32, the read failed and every name said `cl0`). On the E1 shapes the
+   candidate counts are unchanged (no two heuristic results had collided), but saved names now identify the kernel
+   exactly. The heuristic is asked with the fixed
+   256 MiB limit, so the candidate set (and a resume's saved name) no longer depends on the scratch size; candidates
+   needing more than the scratch are not timed. `save()` writes `<path>.tmp.<pid>.<thread>`. `gemm::forget` drops a
+   cache's side-table records (the C ABI calls it before destroying a cache). The C ABI reuses one search scratch per
+   device. Still open: the Entry leak (needs `~GemmCache`, request below) and sharing choices across ranks (S7).
+9. GEMM table without selection bias: tests/s4/gemm_report.py `--runs` prints every run, the median and the best.
+   Three independent searches of the final code (devq t84, t85, t86; bench/s4/results/v8_gemm_runs.md): the median
+   meets the bar at 15 of 44 E1 shape-orientations (best of three: 24). Trunk medians below the bar: dgrad K 768 N 2688
+   0.869, K 768 N 2304 0.890, K 1024 N 3584 0.931, K 512 N 1792 0.937, K 2048 N 7168 0.989; fwd K 2048 N 7168 0.968,
+   K 1024 N 3584 0.967; Levanter wgrad K 768 N 2688 0.963, K 1024 N 3584 0.967, K 2048 N 7168 0.994, K 512 N 1536
+   0.997, K 512 N 1792 0.999; wgrad K 2048 N 7168 0.990. The other 16 are LM-head shapes (S5 owns the CE GEMMs). The
+   earlier "29 of 44" was the best of three. O8: cuBLASLt 13.0 / 12.8 (t84) median 0.995 (0.94-1.10): stay on 12.8.
+10. GQA G = 4 (H 16, KV 4, hd 64 and 128) is tested: reference vs f64 on the A100; on H100 every FA3 mode, the work
+    list, doc_causal and the SM-count grid, deterministic on and off, on the real rows: <= 1.56x floor, bitwise
+    repeatable.
+11. fa3_padded_slots_overflow_guard renamed fa3_full_slots (24 segments in 24 slots); it states the data-path contract
+    instead of claiming a refusal.
+
+Gates (della-vis1 A100, CUDA 12.8, -Werror, 0 warnings; H100 through devq from bench/s4/snap/v7 and v8)
+
+| gate | A100 | H100 |
+|---|---|---|
+| s4_gemm (6 cases incl. every_candidate, custom_kernels with nonzero C) | pass (custom_kernels skips) | pass (t80, t83) |
+| s4_attention (8 cases) | pass (FA3 cases skip) | pass (t80, t83): FA3 <= 1.59x floor, 58 of 58 deterministic runs bitwise repeatable, 12 of 12 production == mode |
+| s4_t1_4 (oracle rule, FA3 via nm_attention_*) | pass (reference) | pass: worst ratio 0.57 (bound 1.25) |
+| s4_graph_nccl (4 GPUs, 100 replays) | skip | pass (t82) |
+| build, CUDA 13.0: S4 object libraries and nm_bench_s4_gemm | 0 warnings | |
+| scrub check (src/kernels/gemm, src/kernels/attention, third_party/fa3-hopper, tests/s4, .gitmodules) | clean | |
+
+E1b after the fixes (devq t81, bench/s4/results/v7-e1b; fwd+bwd ms, deterministic off / on; mode names as in 6)
+
+| shape | E1 bar | stock_exact | stock_padded | sm_grid | persistent | doc_causal |
+|---|---|---|---|---|---|---|
+| 130m | 2.51 | 2.45 / 2.51 | 3.64 / 3.70 | 3.12 / 3.29 | 2.60 / 2.64 | **2.37 / 2.36** |
+| 300m | 3.75 | 3.67 / 3.83 | 5.42 / 5.53 | 4.61 / 4.88 | 3.84 / 3.93 | **3.48 / 3.64** |
+| 520m | 5.68 | 5.62 / 6.09 | 8.19 / 8.62 | 7.70 / 6.82 | 5.77 / 5.67 | **5.15 / 5.27** |
+| 1.2B | 9.21 | 9.34 / 10.18 | 12.34 / 13.26 | 14.43 / 11.40 | 9.49 / 9.45 | **8.94 / 9.25** |
+| 300m S 4480 | 4.71 | 4.74 / 4.98 | 6.59 / 6.72 | 5.52 / 6.48 | 4.94 / 5.08 | 4.37 / 4.77 |
+| sum 130m + 520m + 1.2B | 17.40 | 17.41 / 18.78 | 24.17 / 25.58 | 25.24 / 21.51 | 17.85 / 17.76 | **16.46 / 16.88** |
+
+O1 rule: doc_causal (persistent / doc_causal 1.085 off, 1.052 on). doc_causal meets the bar at every 4096 shape with
+deterministic off (0.91-0.97) and on (0.94-1.00). Errors <= 1.52x floor.
+
+For other owners (S4 does not edit them; adds to the S4 requests above)
+7. attention.hpp: the FA3 entry file is src/kernels/attention/fa3_backend.cu (not fa3_entry.cu); `Persistent` is the
+   device work list on one CTA per list slot (not "grid = SM count; CTAs pull work items"); `AttnFwdArgs::cu_seqlens`
+   is also read by DocCausal's forward at hd 64. State the contract: each row has at most max_segs_per_seq segments
+   (k_doc_meta keeps the first max_segs starts and flags the overflow), so n_segs <= rows * max_segs_per_seq and
+   cu_seqlens[rows * max_segs_per_seq] = total_q; FA3's varlen forward reads every slot and the reference reads
+   cu[slot + 1].
+8. DESIGN §11 / §12.2b: the FA3 deterministic cost for doc_causal is x1.026 (E1b v7, with the hand-off fix).
+9. gemm.hpp (replaces request 4): `~GemmCache()` that frees the entries' descriptors and calls `gemm::forget(*this)`;
+   non-copyable; `std::vector<ShapeReport> report() const`.
+10. S7: GemmCache choices are timing-dependent per process. Ranks of one run and A/B twins (DESIGN §11) must load one
+    gemm_algos.bin: rank 0 searches and saves, the others construct with that path after a barrier.
+
+## S5: fused linear cross-entropy (2026-10-25)
+
+Built (src/kernels/cross_entropy, tests/s5; no header outside the module changed)
+- `ce::run` (behind `fused_linear_ce` and the C ABI `nm_fused_linear_ce`) walks the call in chunks of
+  `CeShape::chunk_rows`; per chunk, as decided (items 10-13): gradient in the forward, bf16 logits store, lse and the
+  softmax statistics from the f32 accumulators, dW accumulated in f32 across chunks and microbatches. Stages:
+  - A: cuBLASLt f32 logits + `k_ce_row_a` (lse, loss, dz in place: bf16 dz over the first half of each f32 row, p
+    from f32(bf16(z)) under the bf16 store; f32 dz under the f32 policy), cuBLASLt dX / dW. The reference, the
+    f32-policy path (true f32 GEMMs, f32 x, W, dX, dW) and the only stage with `logit_bias`.
+  - B1: `k_ce_logits_stats` -> `k_ce_finalize_rows` -> `k_ce_dlogits` (rewrites the store as bf16 dz in place) -> dX
+    and dW GEMMs on the plain dz (cuBLASLt by default, the own kernels on request).
+  - B1.5: the dX kernel computes dz from the store on the fly and writes it in place (its CTA owns a row block over all
+    of D); dW reads the plain dz.
+  - B2: dX and dW both compute dz from the store on the fly.
+  - logits store `exec.ce_logits=f32` (the fallback) works in every stage (sm_90a kernels fall back to the portable
+    ones for it); per-chunk bf16 dW (`CeDwRound::PerChunkBf16` + `ce_finish_microbatch`) in every stage;
+    `accumulate_dx` with the levanter form bf16(old + f32(bf16(acc))) and the accurate form bf16(old + acc); dX may
+    alias x (readouts write d(norm out) over the norm output).
+- sm_90a kernels (ce_sm90.cu; dispatch on compute capability 9.0, portable mma.sync kernels on sm_80 and as fallback):
+  - logits + statistics: persistent, TMA, one producer warpgroup and two consumer warpgroups in ping-pong (named-barrier
+    order: a warpgroup's mainloop starts after the other one has waited on every stage of the previous tile, which also
+    keeps every mbarrier wait within one ring phase), 128 x 128 tile per warpgroup (two wgmma.m64n128k16 per k16 step,
+    128 f32 accumulators per thread), 4-stage ring of 64-wide K blocks, statistics from the accumulators (row max,
+    then sum of libdevice expf, two rows at a time with the exponentials as independent chains), z[target], the bf16
+    store through a 128B-swizzled staging tile and two TMA stores per tile.
+  - dX / dW: one kernel template, 64 output rows x 2 x 256 columns of D (2 x 192 when D is a multiple of 384 but not
+    512), K blocks of 32, 5-stage TMA ring; MN-major operands (descriptor layout confirmed on the H100 by
+    bench/s5_ce/probe_mn.cu); for dz-from-store a transform (warps 1-3 of the producer warpgroup) writes bf16 dz into
+    one of 4 shared tiles once per CTA tile, with lse, g, target loaded by TMA next to each stage; B1.5's in-place
+    dz write from the transform. Bitwise equal to the portable kernels (same K order): dX and dW do not depend on the
+    GPU type.
+- Numerics shared by every stage: one `ce_dz` (p = expf(z_s - lse), dz = p g, dz[target] -= g, explicit roundings,
+  `--fmad=false`), so A (bf16 store emulation), B1, B1.5 and B2 produce the same dz bits; the stage and the GEMM
+  backend change only the GEMM summation order. A target outside [0, V) gets no loss and no gradient.
+- One numeric path for every microbatch size: a row's loss, lse and dX do not depend on the chunk or call size
+  (no split-K in the own kernels; cuBLASLt plans fix one algorithm per (kind, D, V, ld) chosen for 16,384 rows, and
+  a split-K algorithm with a bf16 output must reduce in f32 (CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE) or not split:
+  the A100 heuristic's bf16-output reduction raised the dX error to 1.33x levanter's, DESIGN §3.7). Determinism:
+  no float atomics anywhere; repeat runs are bitwise equal.
+- Loss reduction: `loss_partial[c]` = fixed-order sum of weight x CE per chunk; `ce::grad_scale` (C ABI
+  `nm_ce_grad_scale`) = mult / sum(w) in f32, the spec's denominator (numerics.md §3.6; the trainer passes
+  1/(B_global (S-1)) x readout weight as `grad_scale`).
+- Readouts (`run_readout`, `ce::readout`, C ABI `nm_ce_readout`): readout norm forward into the transient, columns
+  past `visible_dims` zeroed, CE with dW added in place into the head's f32 gradient, d(norm out) written over the
+  norm output, its invisible columns zeroed, then `rmsnorm_bwd_add` adds d(state) into the layer's residual gradient
+  and writes the gain partials. No backbone and no gain gradient: no dX GEMM (the ~1/3 saving). Gain gradient only:
+  the dX GEMM runs (the gain gradient needs it) and the discarded norm dX goes to the free logits store.
+- Options (`ce::Backends`, process-wide, C ABI `nm_ce_set_backends`): plain-dz GEMMs on cuBLASLt (default: 740-820
+  TFLOP/s on H100 against 450-550 for the own kernels) or the own kernels; which sm_90a kernels run (default both);
+  `fast_stats_exp` (`nm_ce_set_fast_stats_exp`, default off): ex2.approx of the rounded d log2(e) for the statistics
+  only, 3 instructions instead of 9 per logit, off until the numerics.md §1 A/B allows a fast-math exponential.
+- `ce_workspace_bytes` = the planner's ws.ce.* layout plus a 32 MiB cuBLASLt workspace region (Hopper cuBLASLt offers
+  no algorithm without one at these shapes) plus dxtmp when V < 32 D - 128 (see requests).
+
+Gates (della-vis1 A100-PCIE-40GB: fresh configure + build, 0 warnings; H100 through devq: t69 every case and T1.5,
+t71 sm90 / bitwise / fast-exp cases on the kernels of this commit; on the final code: t72 every case and T1.5,
+t74 the two-GPU case with sm90 / bitwise / strict / readout)
+
+| gate | checks | A100 | H100 |
+|---|---|---|---|
+| s5_ce grad_V512 / V8256 / V64256 / V128256 | A, B1 (cuBLASLt and own GEMMs), B1.5 (both), B2 at h = 512 / 768 / 1024 / 2048, T = 2,125 (2 chunks + tail), f64 torch autograd oracle: loss and lse within max(2e-5, 1.25 x the emulation's error), dX and dW by the oracle rule against the levanter emulation (numerics.md §5.2 with tensor-core f32 GEMMs), weight-0 loss and dX exactly 0 | pass | pass |
+| s5_ce f32_store | the f32-store fallback, every stage, both GEMM backends | pass | pass |
+| s5_ce bitwise | repeat; chunk 128 / 512 / 1024 / 4096: loss, lse, dX bitwise equal, dW rel < 1e-5; forward-only = the loss of the gradient call; B1 = B1.5 = B2 bitwise with the own GEMMs | pass | pass |
+| s5_ce inplace_dx, accumulate_dx | dX over x equals a separate dX; levanter accumulate bitwise, accurate within one bf16 ulp and not worse | pass | pass |
+| s5_ce strict_dw | PerChunkBf16 + finish_microbatch over two microbatches, bitwise | pass | pass |
+| s5_ce f32_io, odd_shapes | f32 policy (rel <= 1e-5) with and without bias; V = 1000, 8257, 130; D = 520, 136, 64; T = 1; 1-row tail chunk | pass | pass |
+| s5_ce readout | readout = the composed C ABI calls bitwise (both roundings, partial width, gain-only, no backbone, forward-only); f64 autograd sanity | pass | pass |
+| s5_ce sm90_vs_portable, sm90_gemm | sm_90a vs portable: store bitwise equal, loss/lse within 4e-6; own sm_90a GEMMs bitwise equal to the portable ones; repeat and chunk bitwise | skip | pass |
+| s5_ce fast_stats_exp | the opt-in exponential within the grad-case bars; lse moves by <= 1.9e-6, 0.001-0.002 % of dX bits | pass | pass |
+| s5_ce two_devices | the same calls on GPU 0 and GPU 1 of one process give the same bits (per-device cuBLASLt handles and plans, per-device kernel attributes) | skip (1 GPU) | pass (t74) |
+| s5_t15_levref | T1.5, below | pass | pass |
+| compute-sanitizer (CE kernels only, `--kernel-name kns=2nm2ce`) | memcheck on odd_shapes, readout, inplace_dx, strict_dw, f32_io; racecheck and synccheck on every stage and store at V = 1000 / 8257 (racecheck on the V = 128,256 cases did not finish in an hour) | memcheck 0 errors, racecheck 0 hazards, synccheck 0 errors (portable kernels) | |
+
+T1.5 (cache/levref/<size>/t1_units/ce and t1_oracle/ce; 130m and 1_2b; levanter's own error to the f64 oracle:
+grad_x 1.717e-3 / 1.715e-3, grad_w 1.725e-3 / 1.759e-3). Every row passes on both GPUs (t69 on the H100): A, B1
+(cuBLASLt, own), B1.5 (both), B2; chunk 8192 / 16384 (130m) and 32768 (130m, GPUs with >= 60 GiB); bf16 and f32
+store; strict dW. The fast-exponential row passes on both GPUs (t72 on the H100).
+
+| H100 | per-token loss max abs diff (bar 2e-5) | weighted mean rel (bar 1e-6) | grad_x rel / levanter's | grad_w rel / levanter's | bitwise equal to levanter: loss / grad_x / grad_w |
+|---|---|---|---|---|---|
+| 130m, B stages, f32 dW | 1.9e-6 | 2.7e-10 | 1.000 | 0.11-0.13 | 68 % / 99.994 % / 83 % |
+| 130m, A | 1.9e-6 | 1.2e-11 | 1.000 | 0.11-0.13 | 97 % / 100.000 % / 83 % |
+| 130m, strict dW (bf16 per 8192 rows) | 1.9e-6 | 2.7e-10 | 1.000 | 1.000 | 68 % / 99.994 % / 99.97 % |
+| 1_2b, B stages | 1.9e-6 | 3.4e-10 | 1.000 | 0.126 | 68 % / 99.995 % / 80 % |
+| 1_2b, strict dW | 1.9e-6 | 3.4e-10 | 1.000 | 1.000 | 68 % / 99.995 % / 99.96 % |
+
+On the A100 the same rows pass with grad_x at 1.014 x levanter's error (98.5 % of its bits). With the bf16 store the
+port reproduces levanter's batched_xla backward: on the H100, grad_x is levanter's to the bit except 0.006 % of the
+elements and the strict dW is levanter's bf16 grad_w except 0.03 %; the f32 dW is 8x closer to the f64 oracle. T1.5
+passes with the bf16 store, so `exec.ce_logits=auto` = bf16 stands and the f32 store stays only as a knob.
+
+H100 timing (devq, 1 GPU, 5 warm-up + 20 timed calls, median of CUDA events; forward + dX + dW, bf16 store, f32 dW,
+levanter rounding; tests/s5/bench_ce.py focus; other jobs shared the node, run-to-run spread about 3 %):
+
+| rows x h x V | Liger bar (E2) | B1 | B1 / bar | B1, fast statistics exp | B1.5 | B2 | logits + statistics alone |
+|---|---|---|---|---|---|---|---|
+| 16,384 x 512 x 128,256 (pls head) | 13.57 | 13.57 | 1.000 | 13.39 | 16.28 | 19.15 | 4.23 (fast exp 3.74) |
+| 16,384 x 768 x 128,256 | 18.1 | 18.64 | 1.030 | 18.71 | 24.21 | 31.23 | 5.91 |
+| 16,384 x 1,024 x 128,256 | 22.6 | 23.83 | 1.054 | 23.09 | 28.61 | 36.14 | 7.63 |
+| 16,384 x 2,048 x 128,256 | 40.8 | 42.27 | 1.036 | 42.29 | 55.38 | 71.06 | 15.17 |
+| 131,072 x 512 x 128,256 | 109.0 | 113.66 | 1.043 | 109.09 | 123.85 | 152.18 | 35.01 (fast exp 30.84) |
+| 131,072 x 768 x 128,256 | 145.2 | 151.45 | 1.043 | 149.00 | 196.15 | 251.67 | 47.22 |
+| 131,072 x 1,024 x 128,256 | 179.3 | 189.00 | 1.054 | 185.84 | 229.39 | 290.01 | 61.25 |
+| 131,072 x 2,048 x 128,256 | 320.0 | 340.50 | 1.064 | 337.51 | 445.58 | 568.65 | 124.20 |
+| 131,072 x 512 x 64,256 | 53.7 | 56.98 | 1.061 | 54.85 | 62.01 | 75.58 | |
+| 131,072 x 2,048 x 64,256 | 162.4 | 173.43 | 1.068 | 171.47 | 228.20 (t69) | 291.85 (t69) | |
+| 131,072 x 512 x 8,256 (t69) | 8.2 | 7.70 | 0.939 | | 8.43 | 9.95 | |
+| 131,072 x 2,048 x 8,256 (t69) | 21.8 | 22.43 | 1.029 | | 29.41 | 37.72 | |
+
+ms; chunk 16,384 rows; devq t71 (the code of this commit; its runner was cancelled by the controller before the
+V = 8,256 rows), rows marked t69 from the run before the last mainloop change (descriptor arithmetic, -0.15 to
+-0.5 ms per 16,384 rows). B1.5 = the faster of its cuBLASLt / own dW. B1 with the own sm_90a GEMMs: 15.36 / 22.46 /
+27.36 / 54.60 ms at 16,384 rows. B1's dlogits pass alone: 3.06-3.09 ms per 16,384 x 128,256 (2,725-2,746 GB/s). The
+portable logits kernel on the H100: 8.3 ms forward at 16,384 x 512 (the sm_90a kernel 4.23).
+
+O2 per D: B1 (sm_90a logits, dlogits in place, cuBLASLt dX / dW) is the fastest stage that passes T1.5 at every D and
+row count. B1.5 and B2 pass T1.5 and are slower: their dX / dW run on the own GEMM kernels, which reach 450-550
+TFLOP/s on a plain dz against cuBLASLt's 740-820, and the dz transform (3 warps, one per scheduler) takes longer than
+the 512-clock tensor work of a K block, so B2's GEMMs run at ~300 TFLOP/s.
+
+Findings
+- The statistics epilogue first cost 3.3 ms per 2.1e9 logits on top of a 3.3 ms mainloop (D = 512): a conditional
+  libdevice expf compiles to a branch per element (BSSY/BRA/BSYNC), which serializes the exponentials of the one
+  epilogue warp per scheduler. Branch-free selects, two rows at a time and independent exponential chains, plus
+  st.shared for the staging tile, brought the D = 512 forward from 6.8 to 4.2 ms; the dz transform had the same
+  pattern (fixed the same way).
+- setmaxnreg.inc only takes registers a setmaxnreg.dec released: the warpgroup split must sum to the launch
+  allocation (40 + 2 x 232 = 88 + 2 x 208 = 3 x 168). The first dX / dW kernel asked for 96 + 2 x 208 and hung.
+- The hardware applies the shared-memory swizzle by absolute address bits: a dz tile placed 768 B past a 1024-B
+  boundary gave uncorrelated dX (rel 1.41) while the dz written to global memory was right.
+- A 2-CTA cluster variant of the logits kernel (W tiles multicast, half the W L2 traffic) was correct but slower
+  (4.66 vs 4.00 ms at D = 512, 14.7 vs 14.0 ms at D = 2048); with .release.cluster stage releases it was 2.7-3.2x
+  slower. L2 traffic is not what limits the mainloop; the variant was removed.
+- ncu (D = 512 logits): L2 throughput 82 %, tensor pipe 61 %, issue slots 45 %; top stalls fixed-latency waits,
+  short scoreboard, math pipe throttle; the most executed mainloop instructions were the per-k-block descriptor
+  construction and its R2UR moves (now base + offset in the descriptor's low word).
+- Implementation A's row kernel under f32 io read z[target] for the loss while other threads already wrote dz over
+  the row (no barrier on that path): an intermittent wrong per-token loss with right gradients, seen once in the
+  final A100 ctest; fixed with a barrier. The sm_90a launchers first set the large-shared-memory attribute once per
+  process; it is per device (one thread per GPU in the trainer), now set on every launch.
+- A 5-stage ring in the logits kernel (t75; forward only, 16,384 rows, two runs each) gains nothing at D = 512 and
+  1,024 (4.32 / 7.04-7.27 ms against 3.89-4.30 / 7.27-7.31 with 4 stages) and is slower at D = 2,048 (16.1-16.4
+  against 14.1-14.6 ms); the kernel keeps 4 stages.
+- Hopper cuBLASLt offers no algorithm without workspace for these shapes (every cuBLASLt call failed with workspace
+  0); the A100 heuristic picks a split-K whose bf16-output reduction adds a rounding per part.
+
+Known gaps
+- B1 meets the E2 Liger bars only at some shapes: 1.000x at the pls head shape (16,384 x 512 x 128,256), 1.03-1.07x
+  at the other V = 128,256 and 64,256 shapes, 0.94x at 131,072 x 512 x 8,256. The remaining gap is the logits kernel
+  at large D
+  (580-650 TFLOP/s mainloop against cuBLASLt's 740-820 for the same GEMM shape) and its epilogue at D = 512 (4.2 ms
+  against a 3.3 ms mainloop). The fast statistics exponential takes the D = 512 forward to 3.7 ms but is off until its
+  A/B. B2 does not reach its 9.1-10.7 ms target (B2 needs the own GEMM core at cuBLASLt speed and a cheaper transform).
+- The partial-tile statistics path of the sm_90a logits kernel spills one register (4 B; runs only for the last
+  vocab block when V % 128 != 0).
+- `fused_linear_ce` ignores its GemmCache argument (the CE GEMMs are this module's kernels and its own cuBLASLt plans).
+- `run_readout` uses eps = 1e-5 (ReadoutCall carries no eps).
+
+Requests
+- memory planner (src/memory, S0 owner): ws.ce.* lacks the 32 MiB cuBLASLt region (`ce::Ws::ltws`) and, when
+  V < 32 D - 128 (e.g. V = 8,256 at D = 2,048), the [rows, D] dX scratch; `ce_workspace_bytes` is the contract.
+  cross_entropy.hpp: its "B1 at 16384 rows: 4,334,288,896 B" becomes 4,367,843,328 B.
+- cross_entropy.hpp: `ReadoutCall` gets `float eps` (model.norm_eps).
+- DESIGN §3.8: "a readout with dx = nullptr ... computes only its gain gradient" cannot hold (the gain gradient needs
+  d(norm out), the dX GEMM's output); the implemented rule is above.
+- knobs.def / config owner: the GEMM backend of the plain-dz GEMMs and the fast statistics exponential are
+  process-wide options today; if they should be run knobs, `exec.ce_gemm=lt|own` and `exec.ce_stats_exp=accurate|fast`
+  (the latter needs the numerics.md §1 A/B before it can default to fast).
+- DESIGN §3.8 / O2: record B1 as the stage for every D, and the measured B1 margins against the Liger bars.
+
+Commands
+```bash
+ssh della-vis1; cd $ROOT/project/marin.cpp; module load gcc-toolset/14 cudatoolkit/12.8
+export NANOMARIN_ROOT=$ROOT
+nice -n 19 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+  -DCMAKE_CUDA_HOST_COMPILER=g++
+nice -n 19 cmake --build build -j 8 && (cd build && nice -n 19 ctest -R 's5_' -LE bench --output-on-failure)
+python tests/s5/test_ce.py --lib build/libmarincpp_kernels.so --src . grad_V128256 bitwise    # selected cases
+python tests/s5/bench_ce.py --lib build/libmarincpp_kernels.so --src . focus                   # H100, through devq
+```
+
+## S5 review fixes (2026-10-25)
+
+Blocking findings (all three real; fixed)
+1. `loss_partial` (the per-chunk weighted loss sum behind train/loss) had no test. tests/s5 now passes it in every
+   call of `run` and checks it in grad_V*, bitwise (every chunk size, repeat, forward-only, B1 = B1.5 = B2) and
+   odd_shapes (tail chunks): bitwise equal to a torch emulation of `k_ce_chunk_loss` (1,024 thread-strided f32 sums,
+   then the fixed tree; `nmce.chunk_loss_ref`) and rel <= 1e-6 to the f64 per-chunk sum of w x loss_tok. Mutation M8
+   (`*out = red[1]`) now fails grad_V512, bitwise and odd_shapes (rel 0.51).
+2. The accurate `accumulate_dx` was not told apart from the levanter form. The stronger test found a real defect:
+   on the H100 (t72 log), A/lt and B1/lt gave the levanter bits for the accurate form (0.00 operand ulp from
+   bf16(old + bf16(acc)), the same rel 1.706e-3), so Hopper cuBLASLt with beta = 1 and a bf16 C / D rounds the product
+   before the add. Fix (ce_api.cpp `dgrad_plain`): an accurate accumulation always runs the own dgrad kernel (both
+   forms are explicit in its epilogue); cuBLASLt keeps beta = 0 only. accumulate_dx now also requires that the accurate
+   result differs from the levanter form in > 0.1 % of the elements, that its rel to f64 is strictly lower, and that
+   B1, B1.5 and B2 on both GEMM backends give the same accurate bits. A100: 11.37 % of the elements differ, rel
+   1.659e-3 against 1.702e-3. Mutation M12 (the own dgrad always rounds first) now fails every row.
+3. `nm_ce_workspace_bytes` sized the bf16-io layout, but `carve` placed an f32 dX scratch for io = f32, so the
+   cuBLASLt region could run past the caller's buffer. The f32 policy never uses dxtmp (cuBLASLt beta, f32 output), so
+   `carve` no longer places it for io = f32: the f32-io layout is never larger than the bf16-io one that the C ABI
+   reports. The workaround in tests/s5/nmce.py is removed; f32_io runs in a workspace of exactly
+   nm_ce_workspace_bytes followed by a guard band that must stay untouched.
+
+Minor findings
+- H100 provenance: the reviewer matched the sm_90a SASS of the t72 / t74 snapshot (built before the last
+  ce_sm90.cu edit) to the final S5 tree, so t72 / t74 held for S5. This fix changes ce_sm90.cu again; t87 reruns
+  every gate on the library of this fix (bench/s5_ce/snap/fix1, built after the last source edit).
+- Fast statistics exp on the ragged last vocab tile: fixed (`stats_rows<false, true>` when `fast_stats_exp`), so the
+  opt-in mode applies to every tile on both kernels. cuobjdump: LOCAL 0 for every sm_90a CE kernel (also in the
+  t72 snapshot; the 4-B spill of the S5 known gaps is not in these builds).
+- sm90_gemm docstring: B1.5's dgrad runs the sm_90a kernel (write_dz); corrected.
+- `launch_dgrad_sm90` / `launch_wgrad_sm90` check 16-byte alignment of lse, gscale and targets (the 1-D TMA maps)
+  and return false (portable kernel) instead of throwing. odd_shapes adds V = 1,000, D = 512, chunks of 1,022 rows
+  (chunk offsets not a multiple of 4 rows), which takes this path on the H100.
+- Test margins: check_against adds a 1.05x bar against the emulation of the same rounding policy: dX against the
+  levanter (or f32-store) emulation, dW against a new f32-dW emulation of the same dz (`levanter_emulation(f32_dw=True)`;
+  the port's dW is 0.999-1.000x it on the A100, against 0.82-0.97x the levanter-dW emulation). Worst dX on the A100:
+  1.039x (V = 128,256, D = 768, f32 store; t72 H100: 1.025x). odd_shapes drops the absolute floors (`or rel < 4e-3`):
+  every shape passes the plain oracle rule, worst 1.000x the emulation.
+- cuBLASLt plans (ce_lt.cpp): at most 256 plans per device; past that, the device's plans are dropped (the canonical
+  algorithms stay). Safe under one host thread per device.
+- grad_scale: the spec's 128 x 4096 weights (last position 0) give f32(1 / 524160) bitwise, 256 x 4096 give
+  f32(1 / 1048320), and f32(1 / 524160) = 2 f32(1 / 1048320).
+- Not changed: run_readout eps = 1e-5 and the planner's ws.ce.* sizes (requests in S5 stand).
+
+Gates
+- della-vis1 A100, fresh configure and full build: 0 warnings, 0 errors. s5_ce: 14 pass, 3 skip (sm90_vs_portable,
+  sm90_gemm, two_devices). s5_t15_levref: pass (130m, 1_2b; grad_x 1.014x levanter's error).
+- Full ctest (46 entries): 43 pass; s4_graph_nccl skips (no NCCL); s3_t1_levref fails on S3's open items and
+  s6_t1_7_small_lr reports S6's SPECFAIL (item 15), neither in S5 code.
+- Mutants built from a copy of the tree: M8 and M12 fail (above).
+- compute-sanitizer memcheck (`--kernel-name kns=2nm2ce`) on f32_io, accumulate_dx, inplace_dx, strict_dw, readout,
+  grad_scale: 0 errors. Racecheck and synccheck were not rerun: no portable kernel changed.
+- Scrub check: clean on src/kernels/cross_entropy, tests/s5, docs/BUILD_LOG.md.
+- H100, devq t87 (2 GPUs, the library and tests of this fix): s5_ce 17 of 17 pass (two_devices, sm90_vs_portable,
+  sm90_gemm and the chunk-1,022 shape included); accumulate_dx: accurate differs from the levanter form in 11.39 %
+  of the elements on every stage and backend, rel 1.663e-3 against 1.706e-3; worst dX 1.025x the emulation, dW
+  1.000x the f32-dW emulation. s5_t15_levref passes (130m, 1_2b; grad_x 1.000x levanter's error). Quick bench,
+  16,384 x 512 x 128,256: B1 13.40 ms (0.988x the 13.57 ms bar; S5: 13.57), so the fixes cost no time.

@@ -1,0 +1,6 @@
+// FA3 forward variant fwd_hd64_varlen_packgqa (fa3_inst.cuh).
+#include "kernels/attention/fa3_inst.cuh"
+
+namespace nm::fa3k {
+void fwd_hd64_varlen_packgqa(Flash_fwd_params& p, cudaStream_t s) { fwd_variant<64, true, true>(p, s); }
+}  // namespace nm::fa3k

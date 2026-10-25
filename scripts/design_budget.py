@@ -10,7 +10,13 @@ FA3 backward side traffic, embedding reduce-scatter exposure, eval time per run,
 Version 2.1 (S0 review): the strict plans are what `--preset levanter_strict` runs (CE chunk fixed at 8,192 rows plus
 the per-microbatch head-gradient accumulator mb.ce_dw_accum); ZeRO-1 owner shards are ceil(n / NGPU) elements, as the
 C++ planner sizes them; CE head-gradient read-modify-writes count ceil(micro tokens / chunk) chunks per microbatch.
+
+Version 3 (2026-10-25, H100 benches, docs/bench/RESULTS.md): `--measured` prints the §12.2 v3 table. It replaces the
+GEMM and attention efficiencies with the E1 measurements and counts only the CE traffic that no GEMM hides (the
+logits store write is inside the measured GEMM time). Without `--measured` the output is version 2.1 unchanged: the
+C++ `step_budget` and the CE chunk rule reproduce it.
 """
+import sys
 
 GiB = 1024**3
 V = 128256
@@ -36,6 +42,39 @@ SIZES = {
 
 def gemm_eff(D):
     return 0.60 if D <= 512 else 0.66 if D <= 768 else 0.72 if D <= 1024 else 0.78
+
+
+# E1 GEMM sweep (1 H100, bf16, TFLOP/s, best of cuBLAS and XLA per orientation): (M, K, N) -> (fwd, dgrad, wgrad)
+E1_GEMM = {
+    (131072, 512, 1536): (606, 707, 728), (131072, 512, 1792): (645, 715, 712),
+    (131072, 768, 2304): (692, 754, 671), (131072, 768, 2688): (690, 760, 712),
+    (131072, 1024, 3584): (760, 756, 718), (131072, 2048, 7168): (733, 733, 700),
+    (131072, 512, V): (671, 685, 696), (131072, 768, V): (668, 723, 709),
+    (16384, 512, V): (692, 724, 704),
+}
+# E1 FA3 varlen (real cu_seqlens, deterministic off), ms per layer per 32 x 4096 tokens: size -> (fwd, fwd+bwd)
+E1_ATTN = {"130m": (0.66, 2.51), "300m": (0.95, 3.75), "520m": (1.27, 5.68), "1_2b": (1.73, 9.21),
+           "pls_d48": (0.66, 2.51)}
+E8_FA3_DET = 1.14          # E8c: FA3 varlen fwd+bwd, deterministic / default
+CE_EXPOSED_V = {"B1": 4, "B1.5": 2, "B2": 1}   # bytes per token per vocab entry that no GEMM hides (v3)
+
+
+def meas_eff(shapes):
+    t = [x for s in shapes for x in E1_GEMM[s]]
+    return sum(t) / len(t) * 1e12 / PEAK
+
+
+def gemm_eff_meas(D):
+    return meas_eff([s for s in E1_GEMM if s[1] == D and s[2] != V and s[0] == 131072])
+
+
+def ce_eff_meas(D, M):
+    s = (M, D, V)
+    if s in E1_GEMM:
+        return meas_eff([s])
+    if (131072, D, V) in E1_GEMM:
+        return meas_eff([(131072, D, V)])
+    return gemm_eff_meas(D)
 
 
 def params(c):
@@ -128,11 +167,11 @@ def detailed(name, mb, pol, zero1=True, ce_rows=8192, logits_f32=False, strict=F
     return rows, tot
 
 
-def perf(c, mb_seqs, pol, zero1=True, ce_stage="B1", fused=True, ns_prec="tf32", ce_rows=8192):
+def perf(c, mb_seqs, pol, zero1=True, ce_stage="B1", fused=True, ns_prec="tf32", ce_rows=8192, name=None, meas=False):
     D, L, H, KV, hd, F = c["D"], c["L"], c["H"], c["KV"], c["hd"], c["F"]
     p = params(c)
     T = c["B"] * S // NGPU
-    e = gemm_eff(D)
+    e = gemm_eff_meas(D) if meas else gemm_eff(D)
     n_micro = c["B"] // NGPU // mb_seqs
     out = {}
     fwd_gemm = 2 * T * (D * (H + 2 * KV) * hd + H * hd * D + 3 * D * F)
@@ -140,11 +179,17 @@ def perf(c, mb_seqs, pol, zero1=True, ce_stage="B1", fused=True, ns_prec="tf32",
     keys = CAUSAL_COMPUTED * S / 2
     fa_fwd = 4 * T * keys * H * hd
     ef, eb = (0.40, 0.30) if hd == 64 else (0.55, 0.42)
+    if meas:                                                        # E1 FA3 ms per 131,072 tokens per layer
+        f_ms, fb_ms = E1_ATTN[name]
+        ef = fa_fwd * 131072 / T / (f_ms * 1e-3 * PEAK)
+        eb = 2.5 * fa_fwd * 131072 / T / ((fb_ms - f_ms) * 1e-3 * PEAK)
     out["attn_fwd"] = L * fa_fwd / (ef * PEAK) * (2 if pol == "layer" else 1)
     out["attn_bwd"] = L * 2.5 * fa_fwd / (eb * PEAK)
+    if meas:
+        out["attn_det_extra"] = (E8_FA3_DET - 1) * (out["attn_fwd"] + out["attn_bwd"])
     ce_flops = 6 * T * D * V * c["heads"]
-    out["ce_gemm"] = ce_flops / (e * PEAK)
-    extra = {"B1": 6, "B1.5": 4, "B2": 2}[ce_stage]
+    out["ce_gemm"] = ce_flops / ((ce_eff_meas(D, ce_rows) if meas else e) * PEAK)
+    extra = (CE_EXPOSED_V if meas else {"B1": 6, "B1.5": 4, "B2": 2})[ce_stage]
     out["ce_mem"] = extra * V * T * c["heads"] / HBM
     chunks_per_head = n_micro * -(-(mb_seqs * S) // ce_rows)        # per step: ceil(micro tokens / chunk) per microbatch
     out["ce_head_grad_rmw"] = c["heads"] * chunks_per_head * 2 * V * D * 4 / HBM
@@ -207,7 +252,7 @@ def chunk_rule(name, mb, pol, z):
     return ce_rows
 
 
-def show(name, mb, pol, z, perf_rows=True, strict=False):
+def show(name, mb, pol, z, perf_rows=True, strict=False, meas=False):
     c = SIZES[name]
     ce_rows = STRICT_CE_ROWS if strict else chunk_rule(name, mb, pol, z)
     rows, tot = detailed(name, mb, pol, z, ce_rows, strict=strict)
@@ -225,25 +270,31 @@ def show(name, mb, pol, z, perf_rows=True, strict=False):
     if not perf_rows:
         return
     for stage in ("B1", "B1.5", "B2"):
-        out, step, ev = perf(c, mb, pol, z, ce_stage=stage, ce_rows=ce_rows)
+        out, step, ev = perf(c, mb, pol, z, ce_stage=stage, ce_rows=ce_rows, name=name, meas=meas)
         mfu = 3 * lev_fpt(c) * S * c["B"] / step / (NGPU * PEAK) * 100
         print(f"budget CE {stage} (ms): " + ", ".join(f"{k}={v*1e3:.1f}" for k, v in out.items()) +
               f" | step {step*1e3:.1f} ms, tok/s {c['B']*S/step:,.0f}, levanter-MFU {mfu:.1f}%,"
               f" eval {ev:.1f} s x {c['evals']+1} = {ev*(c['evals']+1):.0f} s,"
               f" run {(step*c['N'] + ev*(c['evals']+1))/3600:.2f} h")
-    out_u, step_u, _ = perf(c, mb, pol, z, ce_stage="B1", fused=False, ce_rows=ce_rows)
+    out_u, step_u, _ = perf(c, mb, pol, z, ce_stage="B1", fused=False, ce_rows=ce_rows, name=name, meas=meas)
     print(f"unfused elementwise (B1): {out_u['elementwise']*1e3:.1f} ms, step {step_u*1e3:.1f} ms")
     for prec in ("f32", "3xtf32"):
-        out_p, _, _ = perf(c, mb, pol, z, ce_stage="B1", ns_prec=prec, ce_rows=ce_rows)
+        out_p, _, _ = perf(c, mb, pol, z, ce_stage="B1", ns_prec=prec, ce_rows=ce_rows, name=name, meas=meas)
         print(f"newton_schulz {prec}: {out_p['newton_schulz']*1e3:.1f} ms")
 
 
 def main():
+    meas = "--measured" in sys.argv[1:]
+    if meas:
+        print("# version 3: measured H100 efficiencies (E1 GEMM and FA3, E8 FA3 determinism, exposed CE traffic)")
+        print("GEMM eff (trunk, M=131072):", {D: round(gemm_eff_meas(D), 3) for D in (512, 768, 1024, 2048)})
+        print("CE GEMM eff:", {(D, M): round(ce_eff_meas(D, M), 3) for D, M in ((512, 16384), (512, 32768),
+                                                                               (768, 32768), (1024, 16384), (2048, 16384))})
     for name, mb, pol, z in CHOSEN:
-        show(name, mb, pol, z)
+        show(name, mb, pol, z, meas=meas)
     print("\n## levanter_strict plans (2 x 32 sequences per GPU, remat=layer, CE chunk 8192, head-gradient accumulator)")
     for name, mb, pol, z in STRICT:
-        show(name, mb, pol, z, strict=True)
+        show(name, mb, pol, z, strict=True, meas=meas)
 
 
 if __name__ == "__main__":
