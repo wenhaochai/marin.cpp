@@ -1,5 +1,7 @@
-# src/train: stage S7/S10 (trainer, run directory, step loop, SIGTERM path); DESIGN.md §13.3.
-# Stub created by S0. Register this module's sources here (see cmake/MarinModule.cmake):
-#   nm_module(train PORTABLE <host .cpp and sm_80-safe .cu> SM90A <sm_90a-only .cu> FMAD_OFF <levanter-mode units>
-#             DEPS <CUDA::cublasLt ...>)
-nm_module(train)
+# src/train: stage S7 (optimizer binding of the baseline model, the multi-GPU step loop with one graph per rank);
+# DESIGN.md §1, §2.4, §13.3. The trainer needs NCCL (top-level NM_HAVE_NCCL).
+if(NM_HAVE_NCCL)
+  nm_module(train PORTABLE optimizer.cpp trainer.cpp DEPS CUDA::cublasLt nm::nccl)
+else()
+  nm_module(train PORTABLE optimizer.cpp DEPS CUDA::cublasLt)
+endif()

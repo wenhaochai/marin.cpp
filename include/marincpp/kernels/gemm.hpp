@@ -86,6 +86,11 @@ class GemmCache {
   std::vector<Entry*> entries_;
 };
 
+// Bytes of scratch GemmCache::choose_all needs to time every candidate of one desc (operands, C, the levanter
+// rounding transient, the B^T copy of transposed-B candidates, and cuBLASLt / CUTLASS workspace headroom). A caller
+// that plans several descs passes the maximum.
+size_t gemm_search_scratch_bytes(const GemmDesc& d);
+
 // Convenience wrappers that build the GemmDesc for the three linear-layer GEMMs.
 GemmDesc linear_fwd_desc(int64_t T, int64_t N, int64_t K, Epilogue e, const char* tag);
 GemmDesc linear_dgrad_desc(int64_t T, int64_t N, int64_t K, Epilogue e, const char* tag);

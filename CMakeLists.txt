@@ -48,6 +48,26 @@ include(cmake/MarinFlags.cmake)
 include(cmake/MarinModule.cmake)
 include(cmake/GitVersion.cmake)
 
+# NCCL (the trainer's collectives; DESIGN.md §1.3): -DNM_NCCL_ROOT=<dir with include/nccl.h and lib/libnccl.so*>;
+# default the nvidia-nccl wheel of the bench env ($NANOMARIN_ROOT/envs/nanomarin). Without it the multi-GPU trainer
+# is not built (NM_HAVE_NCCL off) and everything else still is.
+set(_nccl_hint "")
+if(DEFINED ENV{NANOMARIN_ROOT})
+  file(GLOB _nccl_hint LIST_DIRECTORIES true "$ENV{NANOMARIN_ROOT}/envs/nanomarin/lib/python3*/site-packages/nvidia/nccl")
+endif()
+set(NM_NCCL_ROOT "${_nccl_hint}" CACHE PATH "NCCL root (include/nccl.h, lib/libnccl.so*)")
+find_path(NM_NCCL_INCLUDE nccl.h HINTS ${NM_NCCL_ROOT}/include NO_DEFAULT_PATH)
+find_library(NM_NCCL_LIB NAMES nccl libnccl.so.2 HINTS ${NM_NCCL_ROOT}/lib NO_DEFAULT_PATH)
+set(NM_HAVE_NCCL OFF)
+if(NM_NCCL_INCLUDE AND NM_NCCL_LIB)
+  add_library(nm_nccl INTERFACE)
+  target_include_directories(nm_nccl SYSTEM INTERFACE ${NM_NCCL_INCLUDE})
+  target_link_libraries(nm_nccl INTERFACE ${NM_NCCL_LIB})
+  add_library(nm::nccl ALIAS nm_nccl)
+  set(NM_HAVE_NCCL ON)
+endif()
+message(STATUS "marincpp: NCCL ${NM_HAVE_NCCL} (${NM_NCCL_LIB})")
+
 # Modules of DESIGN.md §13.2, in dependency order. Each src/<module>/CMakeLists.txt calls nm_module().
 set(NM_MODULES
   core config memory

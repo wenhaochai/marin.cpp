@@ -41,18 +41,7 @@ DevCache& dev_cache() {
   return d;
 }
 
-size_t scratch_need(const GemmDesc& d) {
-  auto al = [](size_t x) { return (x + 255) / 256 * 256; };
-  const int64_t a_rows = d.op_a == Op::N ? d.m : d.k;
-  const int64_t b_rows = d.op_b == Op::N ? d.k : d.n;
-  size_t n = al(size_t((d.batch - 1) * d.stride_a + a_rows * d.lda) * dtype_size(d.a));
-  n += al(size_t((d.batch - 1) * d.stride_b + b_rows * d.ldb) * dtype_size(d.b));
-  n += al(size_t((d.batch - 1) * d.stride_d + d.m * d.ldd) * dtype_size(d.d));
-  if (d.beta != 0.f) n += al(size_t((d.batch - 1) * d.stride_c + d.m * d.ldc) * dtype_size(d.c));
-  if (d.epilogue == Epilogue::Bf16RoundAddF32) n += al(size_t(d.m) * d.n * 2);
-  if (d.op_b == Op::N) n += al(size_t(d.k) * d.n * 2);   // B^T of the transposed-B candidates
-  return n + (size_t(256) << 20) + (size_t(16) << 20);
-}
+size_t scratch_need(const GemmDesc& d) { return gemm_search_scratch_bytes(d); }
 
 // Search scratch of the current device: kept and grown on demand (tests call the search thousands of times).
 void* search_scratch(size_t need, cudaStream_t s) {
